@@ -226,9 +226,9 @@ const (
 	AmqpsDefaultPort        int32  = 5671
 	EdgeRole                string = "edge"
 	EdgeRouteName           string = "skupper-edge"
-	EdgeListenerPort        int32  = 45671
+	EdgeListenerPort        int32  = 31671
 	InterRouterRole         string = "inter-router"
-	InterRouterListenerPort int32  = 55671
+	InterRouterListenerPort int32  = 32671
 	InterRouterRouteName    string = "skupper-inter-router"
 	InterRouterProfile      string = "skupper-internal"
 	IngressName             string = "skupper"

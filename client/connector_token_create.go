@@ -133,9 +133,9 @@ func configureHostPorts(result *RouterHostPorts, cli *VanClient, namespace strin
 				if host != "" {
 					result.Hosts = host
 					result.InterRouter.Host = host
-					result.InterRouter.Port = "55671"
+					result.InterRouter.Port = "32671"
 					result.Edge.Host = host
-					result.Edge.Port = "45671"
+					result.Edge.Port = "31671"
 					return true
 				} else {
 					fmt.Printf("LoadBalancer Host/IP not yet allocated for service %s, ", service.ObjectMeta.Name)
@@ -175,9 +175,9 @@ func configureHostPorts(result *RouterHostPorts, cli *VanClient, namespace strin
 			host := fmt.Sprintf("%s.%s", types.TransportServiceName, namespace)
 			result.Hosts = host
 			result.InterRouter.Host = host
-			result.InterRouter.Port = "55671"
+			result.InterRouter.Port = "32671"
 			result.Edge.Host = host
-			result.Edge.Port = "45671"
+			result.Edge.Port = "31671"
 			return true
 		}
 	}
