@@ -1,3 +1,19 @@
+# Nethopper
+This is Nethopper's fork of skupper.  To build nethopper, do the following:
+- if you made changes, add & commit & tag this branch with the same version as you merge from upstream skupper (ie. 0.8.7)
+- git tag -f 0.8.7
+
+- build a skupper*.tgz
+  - make clean
+  - make all
+  - make package
+
+- Update nethopper/skupper/releases with for linux.tgz skupper-cli-<0.8.7>-linux-amd64.tgz, so that it can be download during nethopper-agent (agent-kube) repo docker build
+cp release/linux.tgz release/skupper-cli-<0.8.7>-linux-amd64.tgz (replace version 0.8.7 with current version)
+
+# now you can build nethopper/agent-kube
+- follow the instructions in the agent-kube README.md
+
 # Skupper
 
 [![skupper](https://circleci.com/gh/skupperproject/skupper.svg?style=shield)](https://app.circleci.com/pipelines/github/skupperproject/skupper)
