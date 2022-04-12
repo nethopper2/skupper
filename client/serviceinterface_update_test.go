@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"reflect"
 	"testing"
 	"time"
 
@@ -24,6 +25,9 @@ var tcpDeployment *appsv1.Deployment = &appsv1.Deployment{
 	},
 	ObjectMeta: metav1.ObjectMeta{
 		Name: "tcp-go-echo",
+		Labels: map[string]string{
+			"app": "tcp-go-echo",
+		},
 	},
 	Spec: appsv1.DeploymentSpec{
 		Replicas: &depReplicas,
@@ -64,6 +68,9 @@ var tcpStatefulSet *appsv1.StatefulSet = &appsv1.StatefulSet{
 	},
 	ObjectMeta: metav1.ObjectMeta{
 		Name: "tcp-go-echo-ss",
+		Labels: map[string]string{
+			"app": "tcp-go-echo-ss",
+		},
 	},
 	Spec: appsv1.StatefulSetSpec{
 		Replicas: &ssReplicas,
@@ -140,17 +147,18 @@ func TestVanServiceInteraceUpdate(t *testing.T) {
 		doc             string
 		expectedError   string
 		name            string
-		port            int
+		ports           []int
 		eventChannel    bool
 		aggregate       string
+		newLabels       map[string]string
 		secretsExpected []string
 		opts            []cmp.Option
 	}{
 		{
-			doc:           "test one",
+			doc:           "tcp-go-echo - change port",
 			expectedError: "",
 			name:          "tcp-go-echo",
-			port:          9091,
+			ports:         []int{9091},
 			eventChannel:  false,
 			aggregate:     "",
 			opts: []cmp.Option{
@@ -158,21 +166,38 @@ func TestVanServiceInteraceUpdate(t *testing.T) {
 			},
 		},
 		{
-			doc:           "test two",
+			doc:           "tcp-go-echo-ss - change port and add labels",
 			expectedError: "",
-			name:          "nginx",
-			port:          0,
-			eventChannel:  false,
-			aggregate:     "json",
+			name:          "tcp-go-echo-ss",
+			ports:         []int{9091},
+			newLabels: map[string]string{
+				"app": "tcp-go-echo-ss-modified",
+			},
+			eventChannel: false,
+			aggregate:    "",
 			opts: []cmp.Option{
 				trans,
 			},
 		},
 		{
-			doc:           "test three",
+			doc:           "nginx - json aggregation strategy",
 			expectedError: "",
 			name:          "nginx",
-			port:          0,
+			ports:         []int{},
+			eventChannel:  false,
+			aggregate:     "json",
+			newLabels: map[string]string{
+				"app": "nginx",
+			},
+			opts: []cmp.Option{
+				trans,
+			},
+		},
+		{
+			doc:           "nginx - multipart aggregation strategy",
+			expectedError: "",
+			name:          "nginx",
+			ports:         []int{},
 			eventChannel:  false,
 			aggregate:     "multipart",
 			opts: []cmp.Option{
@@ -180,10 +205,10 @@ func TestVanServiceInteraceUpdate(t *testing.T) {
 			},
 		},
 		{
-			doc:           "test four",
+			doc:           "nginx - no aggregation strategy",
 			expectedError: "",
 			name:          "nginx",
-			port:          0,
+			ports:         []int{},
 			eventChannel:  true,
 			aggregate:     "",
 			opts: []cmp.Option{
@@ -191,10 +216,10 @@ func TestVanServiceInteraceUpdate(t *testing.T) {
 			},
 		},
 		{
-			doc:           "test five",
+			doc:           "nginx - error eventChannel with aggregation",
 			expectedError: "Only one of aggregate and event-channel can be specified for a given service.",
 			name:          "nginx",
-			port:          0,
+			ports:         []int{},
 			eventChannel:  true,
 			aggregate:     "json",
 			opts: []cmp.Option{
@@ -202,10 +227,10 @@ func TestVanServiceInteraceUpdate(t *testing.T) {
 			},
 		},
 		{
-			doc:           "test five",
+			doc:           "nginx - invalid aggregation strategy",
 			expectedError: "invalidstrategy is not a valid aggregation strategy. Choose 'json' or 'multipart'.",
 			name:          "nginx",
-			port:          0,
+			ports:         []int{},
 			eventChannel:  false,
 			aggregate:     "invalidstrategy",
 			opts: []cmp.Option{
@@ -259,7 +284,7 @@ func TestVanServiceInteraceUpdate(t *testing.T) {
 	err = cli.ServiceInterfaceCreate(ctx, &types.ServiceInterface{
 		Address:      "noaddress",
 		Protocol:     "tcp",
-		Port:         12345,
+		Ports:        []int{12345},
 		EventChannel: false,
 		Aggregate:    "",
 	})
@@ -281,7 +306,7 @@ func TestVanServiceInteraceUpdate(t *testing.T) {
 	assert.Assert(t, err)
 
 	// wait for skupper router component to be running
-	pods, err := kube.GetDeploymentPods(types.TransportDeploymentName, "skupper.io/component=router", namespace, cli.KubeClient)
+	pods, err := kube.GetPods("skupper.io/component=router", namespace, cli.KubeClient)
 	assert.Assert(t, err)
 	for _, pod := range pods {
 		_, err := kube.WaitForPodStatus(namespace, cli.KubeClient, pod.Name, corev1.PodRunning, time.Second*180, time.Second*5)
@@ -292,7 +317,7 @@ func TestVanServiceInteraceUpdate(t *testing.T) {
 	err = cli.ServiceInterfaceCreate(ctx, &types.ServiceInterface{
 		Address:      "tcp-go-echo",
 		Protocol:     "tcp",
-		Port:         9090,
+		Ports:        []int{9090},
 		EventChannel: false,
 		Aggregate:    "",
 	})
@@ -301,7 +326,7 @@ func TestVanServiceInteraceUpdate(t *testing.T) {
 	err = cli.ServiceInterfaceCreate(ctx, &types.ServiceInterface{
 		Address:      "nginx",
 		Protocol:     "http",
-		Port:         8080,
+		Ports:        []int{8080, 9090},
 		EventChannel: false,
 		Aggregate:    "",
 	})
@@ -310,9 +335,12 @@ func TestVanServiceInteraceUpdate(t *testing.T) {
 	err = cli.ServiceInterfaceCreate(ctx, &types.ServiceInterface{
 		Address:      "tcp-go-echo-ss",
 		Protocol:     "tcp",
-		Port:         9090,
+		Ports:        []int{9090},
 		EventChannel: false,
 		Aggregate:    "",
+		Labels: map[string]string{
+			"service": "tcp-go-echo-ss",
+		},
 	})
 	assert.Assert(t, err)
 
@@ -320,21 +348,21 @@ func TestVanServiceInteraceUpdate(t *testing.T) {
 	// TODO: could range on list if target type was not needed for bind
 	si, err := cli.ServiceInterfaceInspect(ctx, "tcp-go-echo")
 	assert.Assert(t, err)
-	err = cli.ServiceInterfaceBind(ctx, si, "deployment", "tcp-go-echo", "tcp", 9090)
+	err = cli.ServiceInterfaceBind(ctx, si, "deployment", "tcp-go-echo", "tcp", map[int]int{9090: 9090})
 	assert.Assert(t, err)
 
 	si, err = cli.ServiceInterfaceInspect(ctx, "tcp-go-echo-ss")
 	assert.Assert(t, err)
-	err = cli.ServiceInterfaceBind(ctx, si, "statefulset", "tcp-go-echo-ss", "tcp", 9090)
+	err = cli.ServiceInterfaceBind(ctx, si, "statefulset", "tcp-go-echo-ss", "tcp", map[int]int{9090: 9090})
 	assert.Assert(t, err)
 
 	si, err = cli.ServiceInterfaceInspect(ctx, "nginx")
 	assert.Assert(t, err)
 	// bad bind
-	err = cli.ServiceInterfaceBind(ctx, si, "deployment", "nginx2", "http", 8080)
+	err = cli.ServiceInterfaceBind(ctx, si, "deployment", "nginx2", "http", map[int]int{8080: 8080, 9090: 8080})
 	assert.Error(t, err, "Could not read deployment nginx2: deployments.apps \"nginx2\" not found")
 	// good bind
-	err = cli.ServiceInterfaceBind(ctx, si, "deployment", "nginx", "http", 8080)
+	err = cli.ServiceInterfaceBind(ctx, si, "deployment", "nginx", "http", map[int]int{8080: 8080, 9090: 8080})
 	assert.Assert(t, err)
 
 	items, err := cli.ServiceInterfaceList(ctx)
@@ -356,14 +384,17 @@ func TestVanServiceInteraceUpdate(t *testing.T) {
 		si, err := cli.ServiceInterfaceInspect(ctx, c.name)
 		assert.Check(t, err, c.doc)
 
-		if c.port != 0 {
-			si.Port = c.port
+		if len(c.ports) != 0 {
+			si.Ports = c.ports
 		}
 		if c.eventChannel != si.EventChannel {
 			si.EventChannel = c.eventChannel
 		}
 		if c.aggregate != si.Aggregate {
 			si.Aggregate = c.aggregate
+		}
+		if len(c.newLabels) > 0 {
+			si.Labels = c.newLabels
 		}
 		err = cli.ServiceInterfaceUpdate(ctx, si)
 		if c.expectedError == "" {
@@ -377,7 +408,7 @@ func TestVanServiceInteraceUpdate(t *testing.T) {
 	si, err = cli.ServiceInterfaceInspect(ctx, "tcp-go-echo")
 	assert.Assert(t, err)
 	assert.Equal(t, si.Protocol, "tcp")
-	assert.Equal(t, si.Port, 9091)
+	assert.Assert(t, reflect.DeepEqual(si.Ports, []int{9091}))
 
 	si, err = cli.ServiceInterfaceInspect(ctx, "nginx")
 	assert.Assert(t, err)

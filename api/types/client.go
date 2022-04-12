@@ -27,6 +27,7 @@ type LinkStatus struct {
 	Connected   bool
 	Configured  bool
 	Description string
+	Created     string
 }
 
 type SiteConfig struct {
@@ -45,6 +46,8 @@ type Tuning struct {
 	AntiAffinity string
 	Cpu          string
 	Memory       string
+	CpuLimit     string
+	MemoryLimit  string
 }
 
 type RouterOptions struct {
@@ -65,6 +68,7 @@ type SiteConfigSpec struct {
 	SkupperName         string
 	SkupperNamespace    string
 	RouterMode          string
+	Routers             int
 	EnableController    bool
 	EnableServiceSync   bool
 	EnableRouterConsole bool
@@ -77,6 +81,7 @@ type SiteConfigSpec struct {
 	IngressHost         string
 	Replicas            int32
 	SiteControlled      bool
+	CreateNetworkPolicy bool
 	Annotations         map[string]string
 	Labels              map[string]string
 	Router              RouterOptions
@@ -84,11 +89,12 @@ type SiteConfigSpec struct {
 }
 
 const (
-	IngressRouteString        string = "route"
-	IngressLoadBalancerString string = "loadbalancer"
-	IngressNodePortString     string = "nodeport"
-	IngressNginxIngressString string = "nginx-ingress-v1"
-	IngressNoneString         string = "none"
+	IngressRouteString            string = "route"
+	IngressLoadBalancerString     string = "loadbalancer"
+	IngressNodePortString         string = "nodeport"
+	IngressNginxIngressString     string = "nginx-ingress-v1"
+	IngressContourHttpProxyString string = "contour-http-proxy"
+	IngressNoneString             string = "none"
 )
 
 func (s *SiteConfigSpec) IsIngressRoute() bool {
@@ -102,6 +108,9 @@ func (s *SiteConfigSpec) IsIngressNodePort() bool {
 }
 func (s *SiteConfigSpec) IsIngressNginxIngress() bool {
 	return s.Ingress == IngressNginxIngressString
+}
+func (s *SiteConfigSpec) IsIngressContourHttpProxy() bool {
+	return s.Ingress == IngressContourHttpProxyString
 }
 func (s *SiteConfigSpec) IsIngressNone() bool {
 	return s.Ingress == IngressNoneString
@@ -119,6 +128,9 @@ func (s *SiteConfigSpec) IsConsoleIngressNodePort() bool {
 func (s *SiteConfigSpec) IsConsoleIngressNginxIngress() bool {
 	return s.getConsoleIngress() == IngressNginxIngressString
 }
+func (s *SiteConfigSpec) IsConsoleIngressContourHttpProxy() bool {
+	return s.getConsoleIngress() == IngressContourHttpProxyString
+}
 func (s *SiteConfigSpec) IsConsoleIngressNone() bool {
 	return s.getConsoleIngress() == IngressNoneString
 }
@@ -129,8 +141,20 @@ func (s *SiteConfigSpec) getConsoleIngress() string {
 	return s.ConsoleIngress
 }
 
+func ValidIngressOptions() []string {
+	return []string{IngressRouteString, IngressLoadBalancerString, IngressNodePortString, IngressNginxIngressString, IngressContourHttpProxyString, IngressNoneString}
+}
+
 func isValidIngress(ingress string) bool {
-	return ingress == "" || ingress == IngressRouteString || ingress == IngressLoadBalancerString || ingress == IngressNodePortString || ingress == IngressNginxIngressString || ingress == IngressNoneString
+	if ingress == "" {
+		return true
+	}
+	for _, value := range ValidIngressOptions() {
+		if ingress == value {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *SiteConfigSpec) CheckIngress() error {
@@ -184,57 +208,21 @@ type RouterInspectResponse struct {
 	ConsoleUrl        string
 }
 
-type GatewayInitOptions struct {
-	Name         string `json:"name,omitempty"`
-	DownloadOnly bool   `json:"downloadOnly,omitempty"`
-}
-
-type GatewayBindOptions struct {
-	GatewayName string
-	Protocol    string
-	Address     string
-	Host        string
-	Port        string
-	ErrIfNoSvc  bool
-}
-
-type GatewayUnbindOptions struct {
-	GatewayName string
-	Protocol    string
-	Address     string
-}
-
-type GatewayExposeOptions struct {
-	GatewayName string
-	Egress      GatewayBindOptions
-}
-
-type GatewayUnexposeOptions struct {
-	GatewayName  string
-	Address      string
-	DeleteIfLast bool
-}
-
-type GatewayForwardOptions struct {
-	GatewayName string
-	Loopback    bool
-	Service     ServiceInterface
-}
-
 type GatewayEndpoint struct {
-	Name      string `json:"name,omitempty"`
-	Host      string `json:"host,omitempty"`
-	Port      string `json:"port,omitempty"`
-	Address   string `json:"address,omitempty"`
-	LocalPort string `json:"active,omitempty"`
+	Name        string           `json:"name,omitempty" yaml:"name,omitempty"`
+	Host        string           `json:"host,omitempty" yaml:"host,omitempty"`
+	LocalPort   string           `json:"localPort,omitempty" yaml:"local_port,omitempty"`
+	Service     ServiceInterface `json:"service,omitempty" yaml:"service,omitempty"`
+	TargetPorts []int            `json:"targetPorts,omitempty" yaml:"target_ports,omitempty"`
 }
 
 type GatewayInspectResponse struct {
-	GatewayName    string
-	GatewayUrl     string
-	GatewayVersion string
-	TcpConnectors  map[string]GatewayEndpoint
-	TcpListeners   map[string]GatewayEndpoint
+	GatewayName       string
+	GatewayType       string
+	GatewayUrl        string
+	GatewayVersion    string
+	GatewayConnectors map[string]GatewayEndpoint
+	GatewayListeners  map[string]GatewayEndpoint
 }
 
 type VanClientInterface interface {
@@ -245,30 +233,33 @@ type VanClientInterface interface {
 	RouterUpdateVersion(ctx context.Context, hup bool) (bool, error)
 	RouterUpdateVersionInNamespace(ctx context.Context, hup bool, namespace string) (bool, error)
 	ConnectorCreateFromFile(ctx context.Context, secretFile string, options ConnectorCreateOptions) (*corev1.Secret, error)
-	ConnectorCreateSecretFromFile(ctx context.Context, secretFile string, options ConnectorCreateOptions) (*corev1.Secret, error)
+	ConnectorCreateSecretFromData(ctx context.Context, secretData []byte, options ConnectorCreateOptions) (*corev1.Secret, error)
 	ConnectorCreate(ctx context.Context, secret *corev1.Secret, options ConnectorCreateOptions) error
 	ConnectorInspect(ctx context.Context, name string) (*LinkStatus, error)
 	ConnectorList(ctx context.Context) ([]LinkStatus, error)
 	ConnectorRemove(ctx context.Context, options ConnectorRemoveOptions) error
 	ConnectorTokenCreate(ctx context.Context, subject string, namespace string) (*corev1.Secret, bool, error)
 	ConnectorTokenCreateFile(ctx context.Context, subject string, secretFile string) error
-	TokenClaimCreate(ctx context.Context, name string, password []byte, expiry time.Duration, uses int, secretFile string) error
+	TokenClaimCreate(ctx context.Context, name string, password []byte, expiry time.Duration, uses int) (*corev1.Secret, bool, error)
+	TokenClaimCreateFile(ctx context.Context, name string, password []byte, expiry time.Duration, uses int, secretFile string) error
 	ServiceInterfaceCreate(ctx context.Context, service *ServiceInterface) error
 	ServiceInterfaceInspect(ctx context.Context, address string) (*ServiceInterface, error)
 	ServiceInterfaceList(ctx context.Context) ([]*ServiceInterface, error)
 	ServiceInterfaceRemove(ctx context.Context, address string) error
 	ServiceInterfaceUpdate(ctx context.Context, service *ServiceInterface) error
-	ServiceInterfaceBind(ctx context.Context, service *ServiceInterface, targetType string, targetName string, protocol string, targetPort int) error
-	GetHeadlessServiceConfiguration(targetName string, protocol string, address string, port int) (*ServiceInterface, error)
+	ServiceInterfaceBind(ctx context.Context, service *ServiceInterface, targetType string, targetName string, protocol string, targetPorts map[int]int) error
+	GetHeadlessServiceConfiguration(targetName string, protocol string, address string, ports []int) (*ServiceInterface, error)
 	ServiceInterfaceUnbind(ctx context.Context, targetType string, targetName string, address string, deleteIfNoTargets bool) error
-	GatewayBind(ctx context.Context, options GatewayBindOptions) error
-	GatewayUnbind(ctx context.Context, options GatewayUnbindOptions) error
-	GatewayExpose(ctx context.Context, options GatewayExposeOptions) (string, error)
-	GatewayUnexpose(ctx context.Context, options GatewayUnexposeOptions) error
-	GatewayForward(ctx context.Context, options GatewayForwardOptions) error
-	GatewayUnforward(ctx context.Context, gatewayName string, address string) error
-	GatewayInit(ctx context.Context, options GatewayInitOptions) (string, error)
+	GatewayBind(ctx context.Context, gatewayName string, endpoint GatewayEndpoint) error
+	GatewayUnbind(ctx context.Context, gatewayName string, endpoint GatewayEndpoint) error
+	GatewayExpose(ctx context.Context, gatewayName string, gatewayType string, endpoint GatewayEndpoint) (string, error)
+	GatewayUnexpose(ctx context.Context, gatewayName string, endpoint GatewayEndpoint, deleteLast bool) error
+	GatewayForward(ctx context.Context, gatewayName string, endpoint GatewayEndpoint, loopback bool) error
+	GatewayUnforward(ctx context.Context, gatewayName string, endpoint GatewayEndpoint) error
+	GatewayInit(ctx context.Context, gatewayName string, gatewayType string, configFile string) (string, error)
 	GatewayDownload(ctx context.Context, gatewayName string, downloadPath string) (string, error)
+	GatewayExportConfig(ctx context.Context, targetGatewayName string, exportGatewayName string, exportPath string) (string, error)
+	GatewayGenerateBundle(ctx context.Context, configFile string, bundlePath string) (string, error)
 	GatewayInspect(ctx context.Context, gatewayName string) (*GatewayInspectResponse, error)
 	GatewayList(ctx context.Context) ([]*GatewayInspectResponse, error)
 	GatewayRemove(ctx context.Context, gatewayName string) error

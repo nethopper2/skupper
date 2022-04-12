@@ -51,32 +51,25 @@ func WaitSkupperRunning(c *ClusterContext) error {
 }
 
 func WaitSkupperComponentRunning(c *ClusterContext, component string) error {
-
 	tick := constants.DefaultTick
 	timeout := constants.ImagePullingAndResourceCreationTimeout
-
-	// wait for skupper router component to be running
-	pods, err := kube.GetDeploymentPods("", "skupper.io/component="+component, c.Namespace, c.VanClient.KubeClient)
-	if err != nil {
+	// wait for skupper component to be running
+	selector := "skupper.io/component=" + component
+	if err := kube.WaitForPodsStatus(c.Namespace, c.VanClient.KubeClient, selector, corev1.PodRunning, timeout, tick); err != nil {
 		return err
 	}
-	for _, pod := range pods {
-		if _, err := kube.WaitForPodStatus(c.Namespace, c.VanClient.KubeClient, pod.Name, corev1.PodRunning, timeout, tick); err != nil {
-			return err
-		}
-	}
-
 	return nil
 }
 
 // GetConsoleData returns the ConsoleData by querying localhost:8080/DATA
 // on Skupper's proxy controller pod
 func GetConsoleData(cc *ClusterContext, consoleUser, consolePass string) (data.ConsoleData, error) {
-	const dataEndpoint = "http://127.0.0.1:8080/DATA"
+	const dataEndpoint = "https://127.0.0.1:8080/DATA"
 	var consoleData data.ConsoleData
 
 	curlOpts := tools.CurlOpts{
 		Silent:   true,
+		Insecure: true,
 		Username: consoleUser,
 		Password: consolePass,
 		Timeout:  10,

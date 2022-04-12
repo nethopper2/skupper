@@ -8,6 +8,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/util/retry"
 
 	"github.com/skupperproject/skupper/api/types"
@@ -22,80 +23,6 @@ func getRootObject(cli *VanClient) (*metav1.OwnerReference, error) {
 	} else {
 		owner := kube.GetDeploymentOwnerReference(root)
 		return &owner, nil
-	}
-}
-
-func addTargetToServiceInterface(service *types.ServiceInterface, target *types.ServiceInterfaceTarget) {
-	modified := false
-	targets := []types.ServiceInterfaceTarget{}
-	for _, t := range service.Targets {
-		if t.Name == target.Name {
-			modified = true
-			targets = append(targets, *target)
-		} else {
-			targets = append(targets, t)
-		}
-	}
-	if !modified {
-		targets = append(targets, *target)
-	}
-	service.Targets = targets
-}
-
-func getServiceInterfaceTarget(targetType string, targetName string, deducePort bool, cli *VanClient) (*types.ServiceInterfaceTarget, error) {
-	if targetType == "deployment" {
-		deployment, err := cli.KubeClient.AppsV1().Deployments(cli.Namespace).Get(targetName, metav1.GetOptions{})
-		if err == nil {
-			target := types.ServiceInterfaceTarget{
-				Name:     deployment.ObjectMeta.Name,
-				Selector: utils.StringifySelector(deployment.Spec.Selector.MatchLabels),
-			}
-			if deducePort {
-				//TODO: handle case where there is more than one container (need --container option?)
-				if deployment.Spec.Template.Spec.Containers[0].Ports != nil {
-					target.TargetPort = int(deployment.Spec.Template.Spec.Containers[0].Ports[0].ContainerPort)
-				}
-			}
-			return &target, nil
-		} else {
-			return nil, fmt.Errorf("Could not read deployment %s: %s", targetName, err)
-		}
-	} else if targetType == "statefulset" {
-		statefulset, err := cli.KubeClient.AppsV1().StatefulSets(cli.Namespace).Get(targetName, metav1.GetOptions{})
-		if err == nil {
-			target := types.ServiceInterfaceTarget{
-				Name:     statefulset.ObjectMeta.Name,
-				Selector: utils.StringifySelector(statefulset.Spec.Selector.MatchLabels),
-			}
-			if deducePort {
-				//TODO: handle case where there is more than one container (need --container option?)
-				if statefulset.Spec.Template.Spec.Containers[0].Ports != nil {
-					target.TargetPort = int(statefulset.Spec.Template.Spec.Containers[0].Ports[0].ContainerPort)
-				}
-			}
-			return &target, nil
-		} else {
-			return nil, fmt.Errorf("Could not read statefulset %s: %s", targetName, err)
-		}
-	} else if targetType == "pods" {
-		return nil, fmt.Errorf("VAN service interfaces for pods not yet implemented")
-	} else if targetType == "service" {
-		target := types.ServiceInterfaceTarget{
-			Name:    targetName,
-			Service: targetName,
-		}
-		if deducePort {
-			port, err := kube.GetPortForServiceTarget(targetName, cli.Namespace, cli.KubeClient)
-			if err != nil {
-				return nil, err
-			}
-			if port != 0 {
-				target.TargetPort = port
-			}
-		}
-		return &target, nil
-	} else {
-		return nil, fmt.Errorf("VAN service interface unsupported target type")
 	}
 }
 
@@ -118,7 +45,8 @@ func updateServiceInterface(service *types.ServiceInterface, overwriteIfExists b
 				}
 				_, err = cli.KubeClient.CoreV1().ConfigMaps(cli.Namespace).Update(current)
 				if err != nil {
-					return fmt.Errorf("Failed to update skupper-services config map: %s", err)
+					// do not encapsulate this error, or it won't pass the errors.IsConflict test
+					return err
 				} else {
 					return nil
 				}
@@ -161,22 +89,33 @@ func updateServiceInterface(service *types.ServiceInterface, overwriteIfExists b
 }
 
 func validateServiceInterface(service *types.ServiceInterface) error {
-	if service.Headless != nil {
-		if service.Headless.TargetPort < 0 || 65535 < service.Headless.TargetPort {
-			return fmt.Errorf("Bad headless target port number: %d", service.Headless.TargetPort)
+	errs := validation.IsDNS1035Label(service.Address)
+	if len(errs) > 0 {
+		return fmt.Errorf("Invalid service name: %q", errs)
+	}
+	if service.Headless != nil && len(service.Headless.TargetPorts) > 0 {
+		for _, targetPort := range service.Headless.TargetPorts {
+			if targetPort < 0 || 65535 < targetPort {
+				return fmt.Errorf("Bad headless target port number: %d", targetPort)
+			}
 		}
 	}
 
 	for _, target := range service.Targets {
-		if target.TargetPort < 0 || 65535 < target.TargetPort {
-			return fmt.Errorf("Bad target port number. Target: %s  Port: %d", target.Name, target.TargetPort)
+		for _, targetPort := range target.TargetPorts {
+			if targetPort < 0 || 65535 < targetPort {
+				return fmt.Errorf("Bad target port number. Target: %s  Port: %d", target.Name, targetPort)
+			}
 		}
 	}
 
-	//TODO: change service.Protocol to service.Mapping
-	if service.Port < 0 || 65535 < service.Port {
-		return fmt.Errorf("Port %d is outside valid range.", service.Port)
-	} else if service.Aggregate != "" && service.EventChannel {
+	// TODO: change service.Protocol to service.Mapping
+	for _, port := range service.Ports {
+		if port < 0 || 65535 < port {
+			return fmt.Errorf("Port %d is outside valid range.", port)
+		}
+	}
+	if service.Aggregate != "" && service.EventChannel {
 		return fmt.Errorf("Only one of aggregate and event-channel can be specified for a given service.")
 	} else if service.Aggregate != "" && service.Aggregate != "json" && service.Aggregate != "multipart" {
 		return fmt.Errorf("%s is not a valid aggregation strategy. Choose 'json' or 'multipart'.", service.Aggregate)
@@ -211,7 +150,7 @@ func (cli *VanClient) ServiceInterfaceUpdate(ctx context.Context, service *types
 	}
 }
 
-func (cli *VanClient) ServiceInterfaceBind(ctx context.Context, service *types.ServiceInterface, targetType string, targetName string, protocol string, targetPort int) error {
+func (cli *VanClient) ServiceInterfaceBind(ctx context.Context, service *types.ServiceInterface, targetType string, targetName string, protocol string, targetPorts map[int]int) error {
 	owner, err := getRootObject(cli)
 	if err == nil {
 		err = validateServiceInterface(service)
@@ -221,28 +160,33 @@ func (cli *VanClient) ServiceInterfaceBind(ctx context.Context, service *types.S
 		if protocol != "" && service.Protocol != protocol {
 			return fmt.Errorf("Invalid protocol %s for service with mapping %s", protocol, service.Protocol)
 		}
-		target, err := getServiceInterfaceTarget(targetType, targetName, service.Port == 0 && targetPort == 0, cli)
+		deducePorts := len(service.Ports) == 0 && len(targetPorts) == 0
+		target, err := kube.GetServiceInterfaceTarget(targetType, targetName, deducePorts, cli.Namespace, cli.KubeClient)
 		if err != nil {
 			return err
 		}
-		if target.TargetPort != 0 {
-			service.Port = target.TargetPort
-			target.TargetPort = 0
-		} else if targetPort != 0 {
-			if service.Port == 0 {
-				service.Port = targetPort
+		if len(service.Ports) == 0 && len(target.TargetPorts) > 0 {
+			for _, ePort := range target.TargetPorts {
+				service.Ports = append(service.Ports, ePort)
+			}
+			target.TargetPorts = map[int]int{}
+		} else if len(targetPorts) > 0 {
+			if len(service.Ports) == 0 {
+				for iPort, _ := range targetPorts {
+					service.Ports = append(service.Ports, iPort)
+				}
 			} else {
-				target.TargetPort = targetPort
+				target.TargetPorts = targetPorts
 			}
 		}
-		if service.Port == 0 {
+		if len(service.Ports) == 0 {
 			if protocol == "http" {
-				service.Port = 80
+				service.Ports = append(service.Ports, 80)
 			} else {
 				return fmt.Errorf("Service port required and cannot be deduced.")
 			}
 		}
-		addTargetToServiceInterface(service, target)
+		service.AddTarget(target)
 		return updateServiceInterface(service, true, owner, cli)
 	} else if errors.IsNotFound(err) {
 		return fmt.Errorf("Skupper not initialised in %s", cli.Namespace)
@@ -251,7 +195,7 @@ func (cli *VanClient) ServiceInterfaceBind(ctx context.Context, service *types.S
 	}
 }
 
-func (cli *VanClient) GetHeadlessServiceConfiguration(targetName string, protocol string, address string, port int) (*types.ServiceInterface, error) {
+func (cli *VanClient) GetHeadlessServiceConfiguration(targetName string, protocol string, address string, ports []int) (*types.ServiceInterface, error) {
 	statefulset, err := cli.KubeClient.AppsV1().StatefulSets(cli.Namespace).Get(targetName, metav1.GetOptions{})
 	if err == nil {
 		if address != "" && address != statefulset.Spec.ServiceName {
@@ -261,7 +205,7 @@ func (cli *VanClient) GetHeadlessServiceConfiguration(targetName string, protoco
 		if err == nil {
 			def := types.ServiceInterface{
 				Address:  statefulset.Spec.ServiceName,
-				Port:     port,
+				Ports:    ports,
 				Protocol: protocol,
 				Headless: &types.Headless{
 					Name: statefulset.ObjectMeta.Name,
@@ -274,12 +218,14 @@ func (cli *VanClient) GetHeadlessServiceConfiguration(targetName string, protoco
 					},
 				},
 			}
-			if port == 0 {
-				if len(service.Spec.Ports) == 1 {
-					def.Port = int(service.Spec.Ports[0].Port)
-					if service.Spec.Ports[0].TargetPort.IntValue() != 0 && int(service.Spec.Ports[0].Port) != service.Spec.Ports[0].TargetPort.IntValue() {
-						//TODO: handle string ports
-						def.Headless.TargetPort = service.Spec.Ports[0].TargetPort.IntValue()
+			if len(ports) == 0 {
+				if len(service.Spec.Ports) > 0 {
+					for _, port := range service.Spec.Ports {
+						def.Ports = append(def.Ports, int(port.Port))
+						if port.TargetPort.IntValue() != 0 && int(port.Port) != port.TargetPort.IntValue() {
+							// TODO: handle string ports
+							def.Headless.TargetPorts[int(port.Port)] = port.TargetPort.IntValue()
+						}
 					}
 				} else {
 					return nil, fmt.Errorf("Specify port")

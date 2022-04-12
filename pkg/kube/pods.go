@@ -122,6 +122,30 @@ func WaitForPodStatus(namespace string, clientset kubernetes.Interface, podName 
 	return pod, err
 }
 
+func WaitForPodsStatus(namespace string, clientset kubernetes.Interface, selector string, status corev1.PodPhase, timeout time.Duration, interval time.Duration) error {
+	var err error
+
+	ctx, cancel := context.WithTimeout(context.TODO(), timeout)
+	defer cancel()
+	err = utils.RetryWithContext(ctx, interval, func() (bool, error) {
+		pods, err := GetPods(selector, namespace, clientset)
+		if err != nil {
+			return false, nil
+		}
+		if len(pods) == 0 {
+			return false, nil
+		}
+		for _, pod := range pods {
+			if pod.Status.Phase != status {
+				return false, nil
+			}
+		}
+		return true, nil
+	})
+
+	return err
+}
+
 func GetPodContainerLogs(podName string, containerName string, namespace string, clientset kubernetes.Interface) (string, error) {
 	podLogOpts := corev1.PodLogOptions{}
 	return GetPodContainerLogsWithOpts(podName, containerName, namespace, clientset, podLogOpts)
@@ -146,4 +170,14 @@ func GetPodContainerLogsWithOpts(podName string, containerName string, namespace
 	str := buf.String()
 
 	return str, nil
+}
+
+func GetContainerPorts(spec *corev1.PodSpec) []corev1.ContainerPort {
+	ports := []corev1.ContainerPort{}
+	for _, container := range spec.Containers {
+		for _, port := range container.Ports {
+			ports = append(ports, port)
+		}
+	}
+	return ports
 }

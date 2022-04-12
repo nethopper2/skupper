@@ -22,21 +22,25 @@ import (
 // InitTester runs `skupper init` and validates output, console,
 // as well as skupper resources that should be availble in the cluster.
 type InitTester struct {
-	ConsoleAuth         string
-	ConsoleUser         string
-	ConsolePassword     string
-	Ingress             string
-	ConsoleIngress      string
-	RouterDebugMode     string
-	RouterLogging       string
-	RouterMode          string
-	RouterCPU           string
-	RouterMemory        string
-	ControllerCPU       string
-	ControllerMemory    string
-	SiteName            string
-	EnableConsole       bool
-	EnableRouterConsole bool
+	ConsoleAuth           string
+	ConsoleUser           string
+	ConsolePassword       string
+	Ingress               string
+	ConsoleIngress        string
+	RouterDebugMode       string
+	RouterLogging         string
+	RouterMode            string
+	RouterCPU             string
+	RouterMemory          string
+	ControllerCPU         string
+	ControllerMemory      string
+	RouterCPULimit        string
+	RouterMemoryLimit     string
+	ControllerCPULimit    string
+	ControllerMemoryLimit string
+	SiteName              string
+	EnableConsole         bool
+	EnableRouterConsole   bool
 }
 
 func (s *InitTester) Command(cluster *base.ClusterContext) []string {
@@ -79,6 +83,18 @@ func (s *InitTester) Command(cluster *base.ClusterContext) []string {
 	}
 	if s.ControllerMemory != "" {
 		args = append(args, "--controller-memory", s.ControllerMemory)
+	}
+	if s.RouterCPULimit != "" {
+		args = append(args, "--router-cpu-limit", s.RouterCPULimit)
+	}
+	if s.RouterMemoryLimit != "" {
+		args = append(args, "--router-memory-limit", s.RouterMemoryLimit)
+	}
+	if s.ControllerCPULimit != "" {
+		args = append(args, "--controller-cpu-limit", s.ControllerCPULimit)
+	}
+	if s.ControllerMemoryLimit != "" {
+		args = append(args, "--controller-memory-limit", s.ControllerMemoryLimit)
 	}
 	if s.SiteName != "" {
 		args = append(args, "--site-name", s.SiteName)
@@ -375,11 +391,15 @@ func (s *InitTester) ValidateRouterDebugMode(cluster *base.ClusterContext) error
 		return nil
 	}
 	found := false
-	for _, envVar := range dep.Spec.Template.Spec.Containers[0].Env {
-		if envVar.Name == "QDROUTERD_DEBUG" {
-			found = true
-			if envVar.Value != s.RouterDebugMode {
-				return fmt.Errorf("incorrect debug mode defined - expected: %s - found: %s", s.RouterDebugMode, envVar.Value)
+	for _, container := range dep.Spec.Template.Spec.Containers {
+		if container.Name == "router" {
+			for _, envVar := range container.Env {
+				if envVar.Name == "QDROUTERD_DEBUG" {
+					found = true
+					if envVar.Value != s.RouterDebugMode {
+						return fmt.Errorf("incorrect debug mode defined - expected: %s - found: %s", s.RouterDebugMode, envVar.Value)
+					}
+				}
 			}
 		}
 	}
@@ -474,7 +494,7 @@ func (s *InitTester) validateRouterCPUMemory(cluster *base.ClusterContext) error
 
 	// retrieving the router pods
 	routerSelector := fmt.Sprintf("%s=%s", types.ComponentAnnotation, types.TransportComponentName)
-	pods, err := kube.GetDeploymentPods("", routerSelector, cluster.Namespace, cluster.VanClient.KubeClient)
+	pods, err := kube.GetPods(routerSelector, cluster.Namespace, cluster.VanClient.KubeClient)
 	if err != nil {
 		return err
 	}
@@ -482,22 +502,24 @@ func (s *InitTester) validateRouterCPUMemory(cluster *base.ClusterContext) error
 	// looping through pods
 	for _, pod := range pods {
 		for _, container := range pod.Spec.Containers {
-			if !expectResources {
-				// If not expecting requests, but something is defined throw an error
-				if len(container.Resources.Requests) > 0 {
-					return fmt.Errorf("resources not requested but defined in the router (pod: %s, container: %s) - requests: %v",
-						pod.Name, container.Name, container.Resources.Requests)
-				}
-			} else {
-				// If requests have been specified, assert the correct values have been defined
-				cpu := container.Resources.Requests.Cpu().String()
-				mem := container.Resources.Requests.Memory().String()
+			if container.Name == "router" {
+				if !expectResources {
+					// If not expecting requests, but something is defined throw an error
+					if len(container.Resources.Requests) > 0 {
+						return fmt.Errorf("resources not requested but defined in the router (pod: %s, container: %s) - requests: %v",
+							pod.Name, container.Name, container.Resources.Requests)
+					}
+				} else {
+					// If requests have been specified, assert the correct values have been defined
+					cpu := container.Resources.Requests.Cpu().String()
+					mem := container.Resources.Requests.Memory().String()
 
-				if s.RouterCPU != cpu {
-					return fmt.Errorf("--router-cpu defined as: [%s] but container has: [%s]", s.RouterCPU, cpu)
-				}
-				if s.RouterMemory != mem {
-					return fmt.Errorf("--router-memory defined as: [%s] but container has: [%s]", s.RouterMemory, mem)
+					if s.RouterCPU != cpu {
+						return fmt.Errorf("--router-cpu defined as: [%s] but container has: [%s]", s.RouterCPU, cpu)
+					}
+					if s.RouterMemory != mem {
+						return fmt.Errorf("--router-memory defined as: [%s] but container has: [%s]", s.RouterMemory, mem)
+					}
 				}
 			}
 		}
@@ -511,7 +533,7 @@ func (s *InitTester) validateControllerCPUMemory(cluster *base.ClusterContext) e
 
 	// retrieving the service controller pods
 	controllerSelector := fmt.Sprintf("%s=%s", types.ComponentAnnotation, types.ControllerComponentName)
-	pods, err := kube.GetDeploymentPods("", controllerSelector, cluster.Namespace, cluster.VanClient.KubeClient)
+	pods, err := kube.GetPods(controllerSelector, cluster.Namespace, cluster.VanClient.KubeClient)
 	if err != nil {
 		return err
 	}
@@ -519,22 +541,24 @@ func (s *InitTester) validateControllerCPUMemory(cluster *base.ClusterContext) e
 	// looping through pods
 	for _, pod := range pods {
 		for _, container := range pod.Spec.Containers {
-			if !expectResources {
-				// If not expecting requests, but something is defined throw an error
-				if len(container.Resources.Requests) > 0 {
-					return fmt.Errorf("resources not requested but defined in the controller (pod: %s, container: %s) - requests: %v",
-						pod.Name, container.Name, container.Resources.Requests)
-				}
-			} else {
-				// If requests have been specified, assert the correct values have been defined
-				cpu := container.Resources.Requests.Cpu().String()
-				mem := container.Resources.Requests.Memory().String()
+			if container.Name == "router" {
+				if !expectResources {
+					// If not expecting requests, but something is defined throw an error
+					if len(container.Resources.Requests) > 0 {
+						return fmt.Errorf("resources not requested but defined in the controller (pod: %s, container: %s) - requests: %v",
+							pod.Name, container.Name, container.Resources.Requests)
+					}
+				} else {
+					// If requests have been specified, assert the correct values have been defined
+					cpu := container.Resources.Requests.Cpu().String()
+					mem := container.Resources.Requests.Memory().String()
 
-				if s.ControllerCPU != cpu {
-					return fmt.Errorf("--controller-cpu defined as: [%s] but container has: [%s]", s.ControllerCPU, cpu)
-				}
-				if s.ControllerMemory != mem {
-					return fmt.Errorf("--controller-memory defined as: [%s] but container has: [%s]", s.ControllerMemory, mem)
+					if s.ControllerCPU != cpu {
+						return fmt.Errorf("--controller-cpu defined as: [%s] but container has: [%s]", s.ControllerCPU, cpu)
+					}
+					if s.ControllerMemory != mem {
+						return fmt.Errorf("--controller-memory defined as: [%s] but container has: [%s]", s.ControllerMemory, mem)
+					}
 				}
 			}
 		}

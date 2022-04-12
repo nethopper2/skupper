@@ -141,8 +141,16 @@ func (r *RouterConfig) AddHttpConnector(e HttpEndpoint) {
 	r.Bridges.AddHttpConnector(e)
 }
 
+func (r *RouterConfig) RemoveHttpConnector(name string) (bool, HttpEndpoint) {
+	return r.Bridges.RemoveHttpConnector(name)
+}
+
 func (r *RouterConfig) AddHttpListener(e HttpEndpoint) {
 	r.Bridges.AddHttpListener(e)
+}
+
+func (r *RouterConfig) RemoveHttpListener(name string) (bool, HttpEndpoint) {
+	return r.Bridges.RemoveHttpListener(name)
 }
 
 func (r *RouterConfig) UpdateBridgeConfig(desired BridgeConfig) bool {
@@ -194,8 +202,28 @@ func (bc *BridgeConfig) AddHttpConnector(e HttpEndpoint) {
 	bc.HttpConnectors[e.Name] = e
 }
 
+func (bc *BridgeConfig) RemoveHttpConnector(name string) (bool, HttpEndpoint) {
+	tc, ok := bc.HttpConnectors[name]
+	if ok {
+		delete(bc.HttpConnectors, name)
+		return true, tc
+	} else {
+		return false, HttpEndpoint{}
+	}
+}
+
 func (bc *BridgeConfig) AddHttpListener(e HttpEndpoint) {
 	bc.HttpListeners[e.Name] = e
+}
+
+func (bc *BridgeConfig) RemoveHttpListener(name string) (bool, HttpEndpoint) {
+	tc, ok := bc.HttpListeners[name]
+	if ok {
+		delete(bc.HttpListeners, name)
+		return true, tc
+	} else {
+		return false, HttpEndpoint{}
+	}
 }
 
 func GetHttpConnectors(bridges []BridgeConfig) []HttpEndpoint {
@@ -314,23 +342,23 @@ type LogConfig struct {
 }
 
 type Listener struct {
-	Name             string `json:"name,omitempty"`
-	Role             Role   `json:"role,omitempty"`
-	Host             string `json:"host,omitempty"`
-	Port             int32  `json:"port"`
-	RouteContainer   bool   `json:"routeContainer,omitempty"`
-	Http             bool   `json:"http,omitempty"`
-	Cost             int32  `json:"cost,omitempty"`
-	SslProfile       string `json:"sslProfile,omitempty"`
-	SaslMechanisms   string `json:"saslMechanisms,omitempty"`
-	AuthenticatePeer bool   `json:"authenticatePeer,omitempty"`
-	LinkCapacity     int32  `json:"linkCapacity,omitempty"`
-	HttpRootDir      string `json:"httpRootDir,omitempty"`
-	Websockets       bool   `json:"websockets,omitempty"`
-	Healthz          bool   `json:"healthz,omitempty"`
-	Metrics          bool   `json:"metrics,omitempty"`
-	MaxFrameSize     int    `json:"maxFrameSize,omitempty"`
-	MaxSessionFrames int    `json:"maxSessionFrames,omitempty"`
+	Name             string `json:"name,omitempty" yaml:"name,omitempty"`
+	Role             Role   `json:"role,omitempty" yaml:"role,omitempty"`
+	Host             string `json:"host,omitempty" yaml:"host,omitempty"`
+	Port             int32  `json:"port" yaml:"port,omitempty"`
+	RouteContainer   bool   `json:"routeContainer,omitempty" yaml:"route-container,omitempty"`
+	Http             bool   `json:"http,omitempty" yaml:"http,omitempty"`
+	Cost             int32  `json:"cost,omitempty" yaml:"cost,omitempty"`
+	SslProfile       string `json:"sslProfile,omitempty" yaml:"ssl-profile,omitempty"`
+	SaslMechanisms   string `json:"saslMechanisms,omitempty" yaml:"sasl-mechanisms,omitempty"`
+	AuthenticatePeer bool   `json:"authenticatePeer,omitempty" yaml:"authenticate-peer,omitempty"`
+	LinkCapacity     int32  `json:"linkCapacity,omitempty" yaml:"link-capacity,omitempty"`
+	HttpRootDir      string `json:"httpRootDir,omitempty" yaml:"http-rootdir,omitempty"`
+	Websockets       bool   `json:"websockets,omitempty" yaml:"web-sockets,omitempty"`
+	Healthz          bool   `json:"healthz,omitempty" yaml:"healthz,omitempty"`
+	Metrics          bool   `json:"metrics,omitempty" yaml:"metrics,omitempty"`
+	MaxFrameSize     int    `json:"maxFrameSize,omitempty" yaml:"max-frame-size,omitempty"`
+	MaxSessionFrames int    `json:"maxSessionFrames,omitempty" yaml:"max-session-frames,omitempty"`
 }
 
 func (l *Listener) SetMaxFrameSize(value int) {
@@ -775,7 +803,7 @@ func (a *BridgeConfigDifference) Print() {
 
 func GetRouterConfigForHeadlessProxy(definition types.ServiceInterface, siteId string, version string, namespace string) (string, error) {
 	config := InitialConfig("$HOSTNAME", siteId, version, true, 3)
-	//add edge-connector
+	// add edge-connector
 	config.AddSslProfile(SslProfile{
 		Name: types.InterRouterProfile,
 	})
@@ -791,73 +819,81 @@ func GetRouterConfigForHeadlessProxy(definition types.ServiceInterface, siteId s
 		Host: "localhost",
 		Port: 5672,
 	})
-	port := definition.Port
-	if len(definition.Targets) == 1 && definition.Targets[0].TargetPort != 0 {
-		port = definition.Targets[0].TargetPort
-	}
-	if definition.Origin == "" {
-		host := definition.Headless.Name + "-${POD_ID}." + definition.Address + "." + namespace
-		address := definition.Address + "-${POD_ID}"
-		//in the originating site, just have egress bindings
-		switch definition.Protocol {
-		case "tcp":
-			config.AddTcpConnector(TcpEndpoint{
-				Name:    "egress",
-				Host:    host,
-				Port:    strconv.Itoa(port),
-				Address: address,
-				SiteId:  siteId,
-			})
-		case "http":
-			config.AddHttpConnector(HttpEndpoint{
-				Name:    "egress",
-				Host:    host,
-				Port:    strconv.Itoa(port),
-				Address: address,
-				SiteId:  siteId,
-			})
-		case "http2":
-			config.AddHttpConnector(HttpEndpoint{
-				Name:            "egress",
-				Host:            host,
-				Port:            strconv.Itoa(port),
-				Address:         address,
-				ProtocolVersion: HttpVersion2,
-				SiteId:          siteId,
-			})
-		default:
-		}
+	svcPorts := definition.Ports
+	ports := map[int]int{}
+	if len(definition.Targets) > 0 {
+		ports = definition.Targets[0].TargetPorts
 	} else {
-		host := "0.0.0.0"
-		address := definition.Address + "-${POD_ID}"
-		//in all other sites, just have ingress bindings
-		switch definition.Protocol {
-		case "tcp":
-			config.AddTcpListener(TcpEndpoint{
-				Name:    "ingress",
-				Host:    host,
-				Port:    strconv.Itoa(port),
-				Address: address,
-				SiteId:  siteId,
-			})
-		case "http":
-			config.AddHttpListener(HttpEndpoint{
-				Name:    "ingress",
-				Host:    host,
-				Port:    strconv.Itoa(port),
-				Address: address,
-				SiteId:  siteId,
-			})
-		case "http2":
-			config.AddHttpListener(HttpEndpoint{
-				Name:            "ingress",
-				Host:            host,
-				Port:            strconv.Itoa(port),
-				Address:         address,
-				ProtocolVersion: HttpVersion2,
-				SiteId:          siteId,
-			})
-		default:
+		for _, sp := range svcPorts {
+			ports[sp] = sp
+		}
+	}
+	for iPort, ePort := range ports {
+		address := fmt.Sprintf("%s-%s:%d", definition.Address, "${POD_ID}", iPort)
+		if definition.Origin == "" {
+			name := fmt.Sprintf("egress:%d", ePort)
+			host := definition.Headless.Name + "-${POD_ID}." + definition.Address + "." + namespace
+			// in the originating site, just have egress bindings
+			switch definition.Protocol {
+			case "tcp":
+				config.AddTcpConnector(TcpEndpoint{
+					Name:    name,
+					Host:    host,
+					Port:    strconv.Itoa(ePort),
+					Address: address,
+					SiteId:  siteId,
+				})
+			case "http":
+				config.AddHttpConnector(HttpEndpoint{
+					Name:    name,
+					Host:    host,
+					Port:    strconv.Itoa(ePort),
+					Address: address,
+					SiteId:  siteId,
+				})
+			case "http2":
+				config.AddHttpConnector(HttpEndpoint{
+					Name:            name,
+					Host:            host,
+					Port:            strconv.Itoa(ePort),
+					Address:         address,
+					ProtocolVersion: HttpVersion2,
+					SiteId:          siteId,
+				})
+			default:
+			}
+		} else {
+			name := fmt.Sprintf("ingress:%d", ePort)
+			host := "0.0.0.0"
+			// in all other sites, just have ingress bindings
+			switch definition.Protocol {
+			case "tcp":
+				config.AddTcpListener(TcpEndpoint{
+					Name:    name,
+					Host:    host,
+					Port:    strconv.Itoa(iPort),
+					Address: address,
+					SiteId:  siteId,
+				})
+			case "http":
+				config.AddHttpListener(HttpEndpoint{
+					Name:    name,
+					Host:    host,
+					Port:    strconv.Itoa(iPort),
+					Address: address,
+					SiteId:  siteId,
+				})
+			case "http2":
+				config.AddHttpListener(HttpEndpoint{
+					Name:            name,
+					Host:            host,
+					Port:            strconv.Itoa(iPort),
+					Address:         address,
+					ProtocolVersion: HttpVersion2,
+					SiteId:          siteId,
+				})
+			default:
+			}
 		}
 	}
 	return MarshalRouterConfig(config)

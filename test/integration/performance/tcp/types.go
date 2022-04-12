@@ -29,7 +29,7 @@ const (
 // IperfTuning represents possible iPerf3 customizations that can
 // be done through the documented environment variables.
 type IperfTuning struct {
-	ParallelClients int           `json:"parallelClients"`
+	ParallelClients []int         `json:"parallelClients"`
 	TransmitSizes   []string      `json:"transmitSizes"`
 	WindowSize      int           `json:"windowSize"`
 	Memory          string        `json:"memory"`
@@ -38,10 +38,10 @@ type IperfTuning struct {
 }
 
 // ToArgs returns an argument list based on provided settings
-func (i *IperfTuning) ToArgs(hostname string, size string) []string {
+func (i *IperfTuning) ToArgs(hostname string, size string, clients int) []string {
 	params := []string{"-c", hostname, "-n", size}
-	if i.ParallelClients > 0 {
-		params = append(params, "-P", strconv.Itoa(i.ParallelClients))
+	if clients > 0 {
+		params = append(params, "-P", strconv.Itoa(clients))
 	}
 	if i.WindowSize > 0 {
 		params = append(params, "-w", strconv.Itoa(i.WindowSize))
@@ -64,6 +64,7 @@ type SkupperTuning struct {
 type IperfScenario struct {
 	SkupperSites     int           `json:"skupperSites"`
 	TransmitSize     string        `json:"transmitSize"`
+	ParallelClients  int           `json:"parallelClients"`
 	SkupperSettings  SkupperTuning `json:"skupperSettings"`
 	IperfSettings    IperfTuning   `json:"iperfSettings"`
 	testCtx          context.Context
@@ -74,7 +75,7 @@ type IperfScenario struct {
 // getTestName returns an identification for the test iteration
 func (s *IperfScenario) getTestName() string {
 	return fmt.Sprintf("skupper-iperf3-sites_%d-size_%s-clients_%d",
-		s.SkupperSites, s.TransmitSize, s.IperfSettings.ParallelClients)
+		s.SkupperSites, s.TransmitSize, s.ParallelClients)
 }
 
 // clustersNeeded returns number of clusters (contexts) needed by the iteration
@@ -88,7 +89,7 @@ func (s *IperfScenario) clustersNeeded() int {
 // tearDown removes created namespaces
 func (s *IperfScenario) tearDown() {
 	for _, ctx := range s.teardownClusters {
-		ctx.DeleteNamespace()
+		_ = ctx.DeleteNamespace()
 	}
 }
 
@@ -243,11 +244,11 @@ func (s *IperfScenario) exposeIperf3Server(t *testing.T) {
 		iperf3Service := &types.ServiceInterface{
 			Address:  "iperf3-server",
 			Protocol: "tcp",
-			Port:     5201,
+			Ports:    []int{5201},
 		}
 		assert.Assert(t, iperfServerCluster.VanClient.ServiceInterfaceCreate(s.testCtx, iperf3Service))
 		// Binding the service to the deployment
-		assert.Assert(t, iperfServerCluster.VanClient.ServiceInterfaceBind(s.testCtx, iperf3Service, "deployment", iperf3Service.Address, "tcp", 5201))
+		assert.Assert(t, iperfServerCluster.VanClient.ServiceInterfaceBind(s.testCtx, iperf3Service, "deployment", iperf3Service.Address, "tcp", map[int]int{5201: 5201}))
 
 		// Waiting for service to be available across all namespaces/clusters
 		for i := 1; i <= s.clustersNeeded(); i++ {
@@ -305,7 +306,7 @@ func (s *IperfScenario) runIperf3Client(t *testing.T) {
 		BackoffLimit: 10,
 		Restart:      v1.RestartPolicyNever,
 		Labels:       map[string]string{"job": "iperf3-client"},
-		Args:         s.IperfSettings.ToArgs("iperf3-server", s.TransmitSize),
+		Args:         s.IperfSettings.ToArgs("iperf3-server", s.TransmitSize, s.ParallelClients),
 		ResourceReq:  resourceReqs,
 	})
 

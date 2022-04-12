@@ -56,6 +56,17 @@ rules:
   - networking.k8s.io
   resources:
   - ingresses
+  - networkpolicies
+  verbs:
+  - get
+  - list
+  - watch
+  - create
+  - delete
+- apiGroups:
+  - projectcontour.io
+  resources:
+  - httpproxies
   verbs:
   - get
   - list
@@ -105,7 +116,7 @@ spec:
       serviceAccountName: skupper-site-controller
       containers:
       - name: site-controller
-        image: quay.io/skupper/site-controller:0.7.0
+        image: quay.io/skupper/site-controller:0.8.7
         env:
         - name: WATCH_NAMESPACE
           valueFrom:

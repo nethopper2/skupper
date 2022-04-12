@@ -111,7 +111,12 @@ func (cli *VanClient) ConnectorCreateFromFile(ctx context.Context, secretFile st
 		}
 	}
 
-	secret, err := cli.ConnectorCreateSecretFromFile(ctx, secretFile, options)
+	yaml, err := ioutil.ReadFile(secretFile)
+	if err != nil {
+		fmt.Println("Could not read connection token", err.Error())
+		return nil, err
+	}
+	secret, err := cli.ConnectorCreateSecretFromData(ctx, yaml, options)
 	if err != nil {
 		return nil, err
 	}
@@ -159,18 +164,13 @@ func verify(secret *corev1.Secret) error {
 	return nil
 }
 
-func (cli *VanClient) ConnectorCreateSecretFromFile(ctx context.Context, secretFile string, options types.ConnectorCreateOptions) (*corev1.Secret, error) {
-	yaml, err := ioutil.ReadFile(secretFile)
-	if err != nil {
-		fmt.Println("Could not read connection token", err.Error())
-		return nil, err
-	}
+func (cli *VanClient) ConnectorCreateSecretFromData(ctx context.Context, secretData []byte, options types.ConnectorCreateOptions) (*corev1.Secret, error) {
 	current, err := kube.GetDeployment(types.TransportDeploymentName, options.SkupperNamespace, cli.KubeClient)
 	if err == nil {
 		s := json.NewYAMLSerializer(json.DefaultMetaFactory, scheme.Scheme,
 			scheme.Scheme)
 		var secret corev1.Secret
-		_, _, err = s.Decode(yaml, nil, &secret)
+		_, _, err = s.Decode(secretData, nil, &secret)
 		if err != nil {
 			return nil, fmt.Errorf("Could not parse connection token: %w", err)
 		} else {
@@ -179,6 +179,11 @@ func (cli *VanClient) ConnectorCreateSecretFromFile(ctx context.Context, secretF
 			}
 			secret.ObjectMeta.Name = options.Name
 			err = verify(&secret)
+			if err != nil {
+				return nil, err
+			}
+			// Verify if site link can be created
+			err = cli.VerifySecretCompatibility(secret)
 			if err != nil {
 				return nil, err
 			}
@@ -210,6 +215,38 @@ func (cli *VanClient) ConnectorCreateSecretFromFile(ctx context.Context, secretF
 	} else {
 		return nil, fmt.Errorf("Failed to retrieve router deployment: %w", err)
 	}
+}
+
+// VerifySecretCompatibility returns nil if current site version is compatible
+// with the token or cert provided. If sites are not compatible an error is
+// returned with the appropriate information
+func (cli *VanClient) VerifySecretCompatibility(secret corev1.Secret) error {
+	var secretVersion string
+	if secret.Annotations != nil {
+		secretVersion = secret.Annotations[types.SiteVersion]
+	}
+	if err := cli.VerifySiteCompatibility(secretVersion); err != nil {
+		if secretVersion == "" {
+			secretVersion = "undefined"
+		}
+		return fmt.Errorf("%v - remote site version is %s", err, secretVersion)
+	}
+	return nil
+}
+
+// VerifySiteCompatibility returns nil if current site version is compatible
+// with the provided version, otherwise it returns a clear error.
+func (cli *VanClient) VerifySiteCompatibility(siteVersion string) error {
+	siteMeta, err := cli.GetSiteMetadata()
+	if err != nil {
+		return err
+	}
+	if utils.LessRecentThanVersion(siteVersion, siteMeta.Version) {
+		if !utils.IsValidFor(siteVersion, cli.GetMinimumCompatibleVersion()) {
+			return fmt.Errorf("minimum version required %s", cli.GetMinimumCompatibleVersion())
+		}
+	}
+	return nil
 }
 
 func (cli *VanClient) ConnectorCreate(ctx context.Context, secret *corev1.Secret, options types.ConnectorCreateOptions) error {

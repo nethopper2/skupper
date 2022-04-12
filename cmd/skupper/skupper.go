@@ -7,10 +7,9 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
-	"text/tabwriter"
 
 	routev1 "github.com/openshift/api/route/v1"
-
+	"github.com/skupperproject/skupper/pkg/utils/formatter"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/client-go/kubernetes/scheme"
@@ -26,8 +25,8 @@ import (
 type ExposeOptions struct {
 	Protocol    string
 	Address     string
-	Port        int
-	TargetPort  int
+	Ports       []int
+	TargetPorts []string
 	Headless    bool
 	ProxyTuning types.Tuning
 }
@@ -38,8 +37,8 @@ func SkupperNotInstalledError(namespace string) error {
 }
 
 func parseTargetTypeAndName(args []string) (string, string) {
-	//this functions assumes it is called with the right arguments, wrong
-	//argument verification is done on the "Args:" functions
+	// this functions assumes it is called with the right arguments, wrong
+	// argument verification is done on the "Args:" functions
 	targetType := args[0]
 	var targetName string
 	if len(args) == 2 {
@@ -79,6 +78,22 @@ func configureHeadlessProxy(spec *types.Headless, options *types.Tuning) error {
 			err = fmt.Errorf("Invalid value for memory: %s", err)
 		}
 	}
+	if options.CpuLimit != "" {
+		cpuQuantity, err := resource.ParseQuantity(options.CpuLimit)
+		if err == nil {
+			spec.CpuLimit = &cpuQuantity
+		} else {
+			err = fmt.Errorf("Invalid value for cpu: %s", err)
+		}
+	}
+	if options.MemoryLimit != "" {
+		memoryQuantity, err := resource.ParseQuantity(options.MemoryLimit)
+		if err == nil {
+			spec.MemoryLimit = &memoryQuantity
+		} else {
+			err = fmt.Errorf("Invalid value for memory: %s", err)
+		}
+	}
 	return err
 }
 
@@ -95,7 +110,7 @@ func expose(cli types.VanClientInterface, ctx context.Context, targetType string
 			if targetType != "statefulset" {
 				return "", fmt.Errorf("The headless option is only supported for statefulsets")
 			}
-			service, err = cli.GetHeadlessServiceConfiguration(targetName, options.Protocol, options.Address, options.Port)
+			service, err = cli.GetHeadlessServiceConfiguration(targetName, options.Protocol, options.Address, options.Ports)
 			if err != nil {
 				return "", err
 			}
@@ -104,7 +119,7 @@ func expose(cli types.VanClientInterface, ctx context.Context, targetType string
 		} else {
 			service = &types.ServiceInterface{
 				Address:  serviceName,
-				Port:     options.Port,
+				Ports:    options.Ports,
 				Protocol: options.Protocol,
 			}
 		}
@@ -118,7 +133,13 @@ func expose(cli types.VanClientInterface, ctx context.Context, targetType string
 
 	// service may exist from remote origin
 	service.Origin = ""
-	err = cli.ServiceInterfaceBind(ctx, service, targetType, targetName, options.Protocol, options.TargetPort)
+
+	targetPorts, err := parsePortMapping(service, options.TargetPorts)
+	if err != nil {
+		return "", err
+	}
+
+	err = cli.ServiceInterfaceBind(ctx, service, targetType, targetName, options.Protocol, targetPorts)
 	if errors.IsNotFound(err) {
 		return "", SkupperNotInstalledError(cli.GetNamespace())
 	} else if err != nil {
@@ -128,20 +149,11 @@ func expose(cli types.VanClientInterface, ctx context.Context, targetType string
 	return options.Address, nil
 }
 
-func stringSliceContains(s []string, e string) bool {
-	for _, a := range s {
-		if a == e {
-			return true
-		}
-	}
-	return false
-}
-
 var validExposeTargets = []string{"deployment", "statefulset", "pods", "service"}
 
 func verifyTargetTypeFromArgs(args []string) error {
 	targetType, _ := parseTargetTypeAndName(args)
-	if !stringSliceContains(validExposeTargets, targetType) {
+	if !utils.StringSliceContains(validExposeTargets, targetType) {
 		return fmt.Errorf("target type must be one of: [%s]", strings.Join(validExposeTargets, ", "))
 	}
 	return nil
@@ -161,14 +173,15 @@ func exposeTargetArgs(cmd *cobra.Command, args []string) error {
 }
 
 func createServiceArgs(cmd *cobra.Command, args []string) error {
-	if len(args) < 1 || (!strings.Contains(args[0], ":") && len(args) < 2) {
-		return fmt.Errorf("Name and port must be specified")
+	if len(args) < 1 || (len(args) == 1 && !strings.Contains(args[0], ":")) {
+		return fmt.Errorf("Name and port(s) must be specified")
 	}
-	if len(args) > 2 {
-		return fmt.Errorf("illegal argument: %s", args[2])
-	}
-	if len(args) > 1 && strings.Contains(args[0], ":") {
-		return fmt.Errorf("extra argument: %s", args[1])
+	if len(args) > 1 {
+		for _, v := range args[1:] {
+			if _, err := strconv.Atoi(v); err != nil {
+				return fmt.Errorf("%s is not a valid port", v)
+			}
+		}
 	}
 	return nil
 }
@@ -190,11 +203,23 @@ func exposeGatewayArgs(cmd *cobra.Command, args []string) error {
 	if len(args) < 2 || (!strings.Contains(args[1], ":") && len(args) < 3) {
 		return fmt.Errorf("Gateway service address, target host and port must all be specified")
 	}
-	if len(args) > 3 {
-		return fmt.Errorf("illegal argument: %s", args[3])
-	}
 	if len(args) > 2 && strings.Contains(args[1], ":") {
 		return fmt.Errorf("extra argument: %s", args[2])
+	}
+	if len(args) > 2 {
+		for _, v := range args[2:] {
+			ports := strings.Split(v, ":")
+			if len(ports) > 2 {
+				return fmt.Errorf("%s is not a valid port", v)
+			} else if len(ports) == 2 {
+				if _, err := strconv.Atoi(ports[1]); err != nil {
+					return fmt.Errorf("%s is not a valid port", v)
+				}
+			}
+			if _, err := strconv.Atoi(ports[0]); err != nil {
+				return fmt.Errorf("%s is not a valid port", v)
+			}
+		}
 	}
 	return nil
 }
@@ -203,11 +228,15 @@ func bindGatewayArgs(cmd *cobra.Command, args []string) error {
 	if len(args) < 2 || (!strings.Contains(args[1], ":") && len(args) < 3) {
 		return fmt.Errorf("Service address, target host and port must all be specified")
 	}
-	if len(args) > 3 {
-		return fmt.Errorf("illegal argument: %s", args[3])
-	}
 	if len(args) > 2 && strings.Contains(args[1], ":") {
 		return fmt.Errorf("extra argument: %s", args[2])
+	}
+	if len(args) > 2 {
+		for _, v := range args[2:] {
+			if _, err := strconv.Atoi(v); err != nil {
+				return fmt.Errorf("%s is not a valid port", v)
+			}
+		}
 	}
 	return nil
 }
@@ -268,7 +297,7 @@ installation that can then be connected to other skupper installations`,
 		Args:   cobra.NoArgs,
 		PreRun: newClient,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			//TODO: should cli allow init to diff ns?
+			// TODO: should cli allow init to diff ns?
 			silenceCobra(cmd)
 			ns := cli.GetNamespace()
 
@@ -280,7 +309,7 @@ installation that can then be connected to other skupper installations`,
 
 			if routerModeFlag.Changed {
 				options := []string{string(types.TransportModeInterior), string(types.TransportModeEdge)}
-				if !stringSliceContains(options, routerMode) {
+				if !utils.StringSliceContains(options, routerMode) {
 					return fmt.Errorf(`invalid "--router-mode=%v", it must be one of "%v"`, routerMode, strings.Join(options, ", "))
 				}
 				routerCreateOpts.RouterMode = routerMode
@@ -298,7 +327,7 @@ installation that can then be connected to other skupper installations`,
 			if routerIngressFlag.Changed && routerClusterLocalFlag.Changed {
 				return fmt.Errorf(`You can not use the deprecated --cluster-local, and --ingress together, use "--ingress none" as equivalent of --cluster-local`)
 			} else if routerClusterLocalFlag.Changed {
-				if ClusterLocal { //this is redundant, because "if changed" it must be true, but it is also correct
+				if ClusterLocal { // this is redundant, because "if changed" it must be true, but it is also correct
 					routerCreateOpts.Ingress = types.IngressNoneString
 				}
 			} else if !routerIngressFlag.Changed {
@@ -306,6 +335,9 @@ installation that can then be connected to other skupper installations`,
 			}
 			if routerCreateOpts.Ingress == types.IngressNodePortString && routerCreateOpts.IngressHost == "" && routerCreateOpts.Router.IngressHost == "" {
 				return fmt.Errorf(`One of --ingress-host or --router-ingress-host option is required when using "--ingress nodeport"`)
+			}
+			if routerCreateOpts.Ingress == types.IngressContourHttpProxyString && routerCreateOpts.IngressHost == "" {
+				return fmt.Errorf(`--ingress-host option is required when using "--ingress contour-http-proxy"`)
 			}
 			routerCreateOpts.Annotations = asMap(annotations)
 			routerCreateOpts.Labels = asMap(labels)
@@ -362,11 +394,12 @@ installation that can then be connected to other skupper installations`,
 	routerCreateOpts.EnableController = true
 	cmd.Flags().StringVarP(&routerCreateOpts.SkupperName, "site-name", "", "", "Provide a specific name for this skupper installation")
 	cmd.Flags().BoolVarP(&routerCreateOpts.EnableConsole, "enable-console", "", true, "Enable skupper console")
+	cmd.Flags().BoolVarP(&routerCreateOpts.CreateNetworkPolicy, "create-network-policy", "", false, "Create network policy to restrict access to skupper services exposed through this site to current pods in namespace")
 	cmd.Flags().StringVarP(&routerCreateOpts.AuthMode, "console-auth", "", "", "Authentication mode for console(s). One of: 'openshift', 'internal', 'unsecured'")
 	cmd.Flags().StringVarP(&routerCreateOpts.User, "console-user", "", "", "Skupper console user. Valid only when --console-auth=internal")
 	cmd.Flags().StringVarP(&routerCreateOpts.Password, "console-password", "", "", "Skupper console user. Valid only when --console-auth=internal")
-	cmd.Flags().StringVarP(&routerCreateOpts.Ingress, "ingress", "", "", "Setup Skupper ingress to one of: [loadbalancer|route|nodeport|nginx-ingress-v1|none]. If not specified route is used when available, otherwise loadbalancer is used.")
-	cmd.Flags().StringVarP(&routerCreateOpts.ConsoleIngress, "console-ingress", "", "", "Determines if/how console is exposed outside cluster. If not specified uses value of --ingress. One of: [loadbalancer|route|nodeport|nginx-ingress-v1|none].")
+	cmd.Flags().StringVarP(&routerCreateOpts.Ingress, "ingress", "", "", "Setup Skupper ingress to one of: ["+strings.Join(types.ValidIngressOptions(), "|")+"]. If not specified route is used when available, otherwise loadbalancer is used.")
+	cmd.Flags().StringVarP(&routerCreateOpts.ConsoleIngress, "console-ingress", "", "", "Determines if/how console is exposed outside cluster. If not specified uses value of --ingress. One of: ["+strings.Join(types.ValidIngressOptions(), "|")+"].")
 	cmd.Flags().StringVarP(&routerCreateOpts.IngressHost, "ingress-host", "", "", "Hostname by which the ingress proxy can be reached")
 	cmd.Flags().StringVarP(&routerMode, "router-mode", "", string(types.TransportModeInterior), "Skupper router-mode")
 
@@ -377,8 +410,11 @@ installation that can then be connected to other skupper installations`,
 	cmd.Flags().StringVarP(&routerLogging, "router-logging", "", "", "Logging settings for router (e.g. trace,debug,info,notice,warning,error)")
 	cmd.Flags().StringVarP(&routerCreateOpts.Router.DebugMode, "router-debug-mode", "", "", "Enable debug mode for router ('valgrind' or 'gdb' are valid values)")
 
+	cmd.Flags().IntVar(&routerCreateOpts.Routers, "routers", 0, "Number of router replicas to start")
 	cmd.Flags().StringVar(&routerCreateOpts.Router.Cpu, "router-cpu", "", "CPU request for router pods")
 	cmd.Flags().StringVar(&routerCreateOpts.Router.Memory, "router-memory", "", "Memory request for router pods")
+	cmd.Flags().StringVar(&routerCreateOpts.Router.CpuLimit, "router-cpu-limit", "", "CPU limit for router pods")
+	cmd.Flags().StringVar(&routerCreateOpts.Router.MemoryLimit, "router-memory-limit", "", "Memory limit for router pods")
 	cmd.Flags().StringVar(&routerCreateOpts.Router.NodeSelector, "router-node-selector", "", "Node selector to control placement of router pods")
 	cmd.Flags().StringVar(&routerCreateOpts.Router.Affinity, "router-pod-affinity", "", "Pod affinity label matches to control placement of router pods")
 	cmd.Flags().StringVar(&routerCreateOpts.Router.AntiAffinity, "router-pod-antiaffinity", "", "Pod antiaffinity label matches to control placement of router pods")
@@ -386,6 +422,8 @@ installation that can then be connected to other skupper installations`,
 
 	cmd.Flags().StringVar(&routerCreateOpts.Controller.Cpu, "controller-cpu", "", "CPU request for controller pods")
 	cmd.Flags().StringVar(&routerCreateOpts.Controller.Memory, "controller-memory", "", "Memory request for controller pods")
+	cmd.Flags().StringVar(&routerCreateOpts.Controller.CpuLimit, "controller-cpu-limit", "", "CPU limit for controller pods")
+	cmd.Flags().StringVar(&routerCreateOpts.Controller.MemoryLimit, "controller-memory-limit", "", "Memory limit for controller pods")
 	cmd.Flags().StringVar(&routerCreateOpts.Controller.NodeSelector, "controller-node-selector", "", "Node selector to control placement of controller pods")
 	cmd.Flags().StringVar(&routerCreateOpts.Controller.Affinity, "controller-pod-affinity", "", "Pod affinity label matches to control placement of controller pods")
 	cmd.Flags().StringVar(&routerCreateOpts.Controller.AntiAffinity, "controller-pod-antiaffinity", "", "Pod antiaffinity label matches to control placement of controller pods")
@@ -424,7 +462,11 @@ func NewCmdDelete(newClient cobraFunc) *cobra.Command {
 		PreRun: newClient,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			silenceCobra(cmd)
-			err := cli.SiteConfigRemove(context.Background())
+			gateways, err := cli.GatewayList(context.Background())
+			for _, gateway := range gateways {
+				cli.GatewayRemove(context.Background(), gateway.GatewayName)
+			}
+			err = cli.SiteConfigRemove(context.Background())
 			if err != nil {
 				err = cli.RouterRemove(context.Background())
 			}
@@ -609,8 +651,8 @@ func NewCmdExpose(newClient cobraFunc) *cobra.Command {
 
 			targetType, targetName := parseTargetTypeAndName(args)
 
-			//silence cobra may be moved below the "if" we want to print
-			//the usage message along with this error
+			// silence cobra may be moved below the "if" we want to print
+			// the usage message along with this error
 			if exposeOpts.Address == "" {
 				if targetType == "service" {
 					return fmt.Errorf("--address option is required for target type 'service'")
@@ -626,6 +668,12 @@ func NewCmdExpose(newClient cobraFunc) *cobra.Command {
 				if exposeOpts.ProxyTuning.Memory != "" {
 					return fmt.Errorf("--proxy-memory option is only valid for headless services")
 				}
+				if exposeOpts.ProxyTuning.CpuLimit != "" {
+					return fmt.Errorf("--proxy-cpu-limit option is only valid for headless services")
+				}
+				if exposeOpts.ProxyTuning.MemoryLimit != "" {
+					return fmt.Errorf("--proxy-memory-limit option is only valid for headless services")
+				}
 				if exposeOpts.ProxyTuning.Affinity != "" {
 					return fmt.Errorf("--proxy-pod-affinity option is only valid for headless services")
 				}
@@ -636,7 +684,6 @@ func NewCmdExpose(newClient cobraFunc) *cobra.Command {
 					return fmt.Errorf("--proxy-node-selector option is only valid for headless services")
 				}
 			}
-
 			addr, err := expose(cli, context.Background(), targetType, targetName, exposeOpts)
 			if err == nil {
 				fmt.Printf("%s %s exposed as %s\n", targetType, targetName, addr)
@@ -646,11 +693,13 @@ func NewCmdExpose(newClient cobraFunc) *cobra.Command {
 	}
 	cmd.Flags().StringVar(&(exposeOpts.Protocol), "protocol", "tcp", "The protocol to proxy (tcp, http, or http2)")
 	cmd.Flags().StringVar(&(exposeOpts.Address), "address", "", "The Skupper address to expose")
-	cmd.Flags().IntVar(&(exposeOpts.Port), "port", 0, "The port to expose on")
-	cmd.Flags().IntVar(&(exposeOpts.TargetPort), "target-port", 0, "The port to target on pods")
+	cmd.Flags().IntSliceVar(&(exposeOpts.Ports), "port", []int{}, "The ports to expose on")
+	cmd.Flags().StringSliceVar(&(exposeOpts.TargetPorts), "target-port", []string{}, "The ports to target on pods")
 	cmd.Flags().BoolVar(&(exposeOpts.Headless), "headless", false, "Expose through a headless service (valid only for a statefulset target)")
 	cmd.Flags().StringVar(&exposeOpts.ProxyTuning.Cpu, "proxy-cpu", "", "CPU request for router pods")
 	cmd.Flags().StringVar(&exposeOpts.ProxyTuning.Memory, "proxy-memory", "", "Memory request for router pods")
+	cmd.Flags().StringVar(&exposeOpts.ProxyTuning.CpuLimit, "proxy-cpu-limit", "", "CPU limit for router pods")
+	cmd.Flags().StringVar(&exposeOpts.ProxyTuning.MemoryLimit, "proxy-memory-limit", "", "Memory limit for router pods")
 	cmd.Flags().StringVar(&exposeOpts.ProxyTuning.NodeSelector, "proxy-node-selector", "", "Node selector to control placement of router pods")
 	cmd.Flags().StringVar(&exposeOpts.ProxyTuning.Affinity, "proxy-pod-affinity", "", "Pod affinity label matches to control placement of router pods")
 	cmd.Flags().StringVar(&exposeOpts.ProxyTuning.AntiAffinity, "proxy-pod-antiaffinity", "", "Pod antiaffinity label matches to control placement of router pods")
@@ -692,6 +741,7 @@ func NewCmdListExposed(newClient cobraFunc) *cobra.Command {
 }
 
 func NewCmdServiceStatus(newClient cobraFunc) *cobra.Command {
+	showLabels := false
 	cmd := &cobra.Command{
 		Use:    "status",
 		Short:  "List services exposed over the service network",
@@ -704,30 +754,43 @@ func NewCmdServiceStatus(newClient cobraFunc) *cobra.Command {
 				if len(vsis) == 0 {
 					fmt.Println("No services defined")
 				} else {
-					fmt.Println("Services exposed through Skupper:")
+					l := formatter.NewList()
+					l.Item("Services exposed through Skupper:")
 					for _, si := range vsis {
-						if len(si.Targets) == 0 {
-							fmt.Printf("    %s (%s port %d)", si.Address, si.Protocol, si.Port)
-							fmt.Println()
-						} else {
-							fmt.Printf("    %s (%s port %d) with targets", si.Address, si.Protocol, si.Port)
-							fmt.Println()
+						portStr := "port"
+						if len(si.Ports) > 1 {
+							portStr = "ports"
+						}
+						for _, port := range si.Ports {
+							portStr += fmt.Sprintf(" %d", port)
+						}
+						svc := l.NewChild(fmt.Sprintf("%s (%s %s)", si.Address, si.Protocol, portStr))
+						if len(si.Targets) > 0 {
+							targets := svc.NewChild("Targets:")
 							for _, t := range si.Targets {
 								var name string
 								if t.Name != "" {
 									name = fmt.Sprintf("name=%s", t.Name)
 								}
+								targetInfo := ""
 								if t.Selector != "" {
-									fmt.Printf("      => %s %s", t.Selector, name)
+									targetInfo = fmt.Sprintf("%s %s", t.Selector, name)
 								} else if t.Service != "" {
-									fmt.Printf("      => %s %s", t.Service, name)
+									targetInfo = fmt.Sprintf("%s %s", t.Service, name)
 								} else {
-									fmt.Printf("      => %s (no selector)", name)
+									targetInfo = fmt.Sprintf("%s (no selector)", name)
 								}
-								fmt.Println()
+								targets.NewChild(targetInfo)
+							}
+						}
+						if showLabels && len(si.Labels) > 0 {
+							labels := svc.NewChild("Labels:")
+							for k, v := range si.Labels {
+								labels.NewChild(fmt.Sprintf("%s=%s", k, v))
 							}
 						}
 					}
+					l.Print()
 				}
 			} else {
 				return fmt.Errorf("Could not retrieve services: %w", err)
@@ -735,8 +798,99 @@ func NewCmdServiceStatus(newClient cobraFunc) *cobra.Command {
 			return nil
 		},
 	}
-
+	cmd.Flags().BoolVar(&showLabels, "show-labels", false, "show service labels")
 	return cmd
+}
+
+func NewCmdServiceLabel(newClient cobraFunc) *cobra.Command {
+
+	var addLabels, removeLabels []string
+	var showLabels bool
+	labels := &cobra.Command{
+		Use:   "label <service> [labels...]",
+		Short: "Manage service labels",
+		Example: `
+        # show labels for my-service
+        skupper service label my-service
+
+        # add label1=value1 and label2=value2 to my-service
+        skupper service label my-service label1=value1 label2=value2
+
+        # add label1=value1 and remove label2 to/from my-service 
+        skupper service label my-service label1=value1 label2-`,
+		PreRun: newClient,
+		Args: func(cmd *cobra.Command, args []string) error {
+			if len(args) < 1 {
+				return fmt.Errorf("service name is required")
+			} else if len(args) == 1 {
+				showLabels = true
+			}
+			if len(args) > 1 {
+				for i := 1; i < len(args); i++ {
+					label := args[i]
+					labelFields := len(strings.Split(label, "="))
+					if labelFields == 2 {
+						addLabels = append(addLabels, label)
+					} else if labelFields == 1 {
+						if !strings.HasSuffix(label, "-") {
+							return fmt.Errorf("no value provided to label %s", label)
+						}
+						removeLabels = append(removeLabels, strings.TrimSuffix(label, "-"))
+					} else {
+						return fmt.Errorf("invalid label [%s], use key=value or key- (to remove)", label)
+					}
+				}
+			}
+			return nil
+		},
+		RunE: func(cmd *cobra.Command, args []string) error {
+			name := args[0]
+			si, err := cli.ServiceInterfaceInspect(context.Background(), name)
+			if si == nil {
+				return fmt.Errorf("invalid service name")
+			}
+			if err != nil {
+				return fmt.Errorf("error retrieving service: %v", err)
+			}
+			if showLabels {
+				if si.Labels != nil && len(si.Labels) > 0 {
+					l := formatter.NewList()
+					l.Item(name)
+					labels := l.NewChild("Labels:")
+					for k, v := range si.Labels {
+						labels.NewChild(fmt.Sprintf("%s=%s", k, v))
+					}
+					l.Print()
+				} else {
+					fmt.Printf("%s has no labels", name)
+					fmt.Println()
+				}
+				return nil
+			}
+			curLabels := si.Labels
+			if curLabels == nil {
+				curLabels = map[string]string{}
+			}
+			// removing labels
+			for _, rmlabel := range removeLabels {
+				delete(curLabels, rmlabel)
+			}
+			// adding labels
+			for _, addLabels := range addLabels {
+				for k, v := range utils.LabelToMap(addLabels) {
+					curLabels[k] = v
+				}
+			}
+			si.Labels = curLabels
+			err = cli.ServiceInterfaceUpdate(context.Background(), si)
+			if err != nil {
+				return fmt.Errorf("error updating service labels: %v", err)
+			}
+			return nil
+		},
+	}
+
+	return labels
 }
 
 func NewCmdService() *cobra.Command {
@@ -751,30 +905,31 @@ var serviceToCreate types.ServiceInterface
 
 func NewCmdCreateService(newClient cobraFunc) *cobra.Command {
 	cmd := &cobra.Command{
-		Use:    "create <name> <port>",
+		Use:    "create <name> <port...>",
 		Short:  "Create a skupper service",
 		Args:   createServiceArgs,
 		PreRun: newClient,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			silenceCobra(cmd)
-			var sPort string
+			var sPorts []string
 			if len(args) == 1 {
 				parts := strings.Split(args[0], ":")
 				serviceToCreate.Address = parts[0]
-				sPort = parts[1]
+				sPorts = []string{parts[1]}
 			} else {
 				serviceToCreate.Address = args[0]
-				sPort = args[1]
+				sPorts = args[1:]
 			}
-			servicePort, err := strconv.Atoi(sPort)
-			if err != nil {
-				return fmt.Errorf("%s is not a valid port", sPort)
-			} else {
-				serviceToCreate.Port = servicePort
-				err = cli.ServiceInterfaceCreate(context.Background(), &serviceToCreate)
+			for _, p := range sPorts {
+				servicePort, err := strconv.Atoi(p)
 				if err != nil {
-					return fmt.Errorf("%w", err)
+					return fmt.Errorf("%s is not a valid port", p)
 				}
+				serviceToCreate.Ports = append(serviceToCreate.Ports, servicePort)
+			}
+			err := cli.ServiceInterfaceCreate(context.Background(), &serviceToCreate)
+			if err != nil {
+				return fmt.Errorf("%w", err)
 			}
 			return nil
 		},
@@ -804,7 +959,7 @@ func NewCmdDeleteService(newClient cobraFunc) *cobra.Command {
 	return cmd
 }
 
-var targetPort int
+var targetPorts []string
 var protocol string
 
 func NewCmdBind(newClient cobraFunc) *cobra.Command {
@@ -826,20 +981,65 @@ func NewCmdBind(newClient cobraFunc) *cobra.Command {
 					return fmt.Errorf("%w", err)
 				} else if service == nil {
 					return fmt.Errorf("Service %s not found", args[0])
-				} else {
-					err = cli.ServiceInterfaceBind(context.Background(), service, targetType, targetName, protocol, targetPort)
-					if err != nil {
-						return fmt.Errorf("%w", err)
-					}
+				}
+
+				// validating ports
+				portMapping, err := parsePortMapping(service, targetPorts)
+				if err != nil {
+					return err
+				}
+
+				err = cli.ServiceInterfaceBind(context.Background(), service, targetType, targetName, protocol, portMapping)
+				if err != nil {
+					return fmt.Errorf("%w", err)
 				}
 			}
 			return nil
 		},
 	}
 	cmd.Flags().StringVar(&protocol, "protocol", "", "The protocol to proxy (tcp, http or http2).")
-	cmd.Flags().IntVar(&targetPort, "target-port", 0, "The port the target is listening on.")
+	cmd.Flags().StringSliceVar(&targetPorts, "target-port", []string{}, "The port the target is listening on (you can also use colon to map source-port to a target-port).")
 
 	return cmd
+}
+
+func parsePortMapping(service *types.ServiceInterface, targetPorts []string) (map[int]int, error) {
+	if len(targetPorts) > 0 && len(service.Ports) != len(targetPorts) {
+		return nil, fmt.Errorf("service defines %d ports but only %d mapped (all ports must be mapped)",
+			len(service.Ports), len(targetPorts))
+	}
+	ports := map[int]int{}
+	for _, port := range service.Ports {
+		ports[port] = port
+	}
+	for i, port := range targetPorts {
+		portSplit := strings.SplitN(port, ":", 2)
+		var sPort, tPort string
+		sPort = portSplit[0]
+		tPort = sPort
+		mapping := false
+		if len(portSplit) == 2 {
+			tPort = portSplit[1]
+			mapping = true
+		}
+		var isp, itp int
+		var err error
+		if isp, err = strconv.Atoi(sPort); err != nil {
+			return nil, fmt.Errorf("invalid source port: %s", sPort)
+		}
+		if itp, err = strconv.Atoi(tPort); err != nil {
+			return nil, fmt.Errorf("invalid target port: %s", tPort)
+		}
+		if _, ok := ports[isp]; mapping && !ok {
+			return nil, fmt.Errorf("source port not defined in service: %d", isp)
+		}
+		// if target port not mapped, use positional index to determine it
+		if !mapping {
+			isp = service.Ports[i]
+		}
+		ports[isp] = itp
+	}
+	return ports, nil
 }
 
 func NewCmdUnbind(newClient cobraFunc) *cobra.Command {
@@ -875,7 +1075,11 @@ func NewCmdGateway() *cobra.Command {
 	return cmd
 }
 
-var gatewayInitOptions types.GatewayInitOptions
+var gatewayName string
+var gatewayConfigFile string
+var gatewayExportOnly bool
+var gatewayEndpoint types.GatewayEndpoint
+var gatewayType string
 
 func NewCmdInitGateway(newClient cobraFunc) *cobra.Command {
 	cmd := &cobra.Command{
@@ -886,20 +1090,30 @@ func NewCmdInitGateway(newClient cobraFunc) *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			silenceCobra(cmd)
 
-			_, err := cli.GatewayInit(context.Background(), gatewayInitOptions)
+			if gatewayType != "" && gatewayType != "service" && gatewayType != "docker" && gatewayType != "podman" {
+				return fmt.Errorf("%s is not a valid gateway type. Choose 'service', 'docker' or 'podman'.", gatewayType)
+			}
+
+			actual, err := cli.GatewayInit(context.Background(), gatewayName, gatewayType, gatewayConfigFile)
 			if err != nil {
 				return fmt.Errorf("%w", err)
 			}
+			fmt.Println("Skupper gateway '" + actual + "' created. Use 'skupper gateway status' to get more informaiton.")
 
 			return nil
 		},
 	}
-	cmd.Flags().StringVar(&gatewayInitOptions.Name, "name", "", "The name of the gateway definition")
-	cmd.Flags().BoolVarP(&gatewayInitOptions.DownloadOnly, "downloadonly", "", false, "Gateway definition to be downloaded only (e.g. will not be started)")
+	cmd.Flags().StringVarP(&gatewayType, "type", "", "service", "The gateway type one of: 'service', 'docker', 'podman'")
+	cmd.Flags().StringVar(&gatewayName, "name", "", "The name of the gateway definition")
+	cmd.Flags().StringVar(&gatewayConfigFile, "config", "", "The gateway config file to use for initialization")
+	cmd.Flags().BoolVarP(&gatewayExportOnly, "exportonly", "", false, "Gateway definition for export-config only (e.g. will not be started)")
+
+	f := cmd.Flag("exportonly")
+	f.Deprecated = "exportonly flag for gateway definition is deprecated, gateway will be started"
+	f.Hidden = true
+
 	return cmd
 }
-
-var deleteGatewayName string
 
 func NewCmdDeleteGateway(newClient cobraFunc) *cobra.Command {
 	cmd := &cobra.Command{
@@ -910,19 +1124,16 @@ func NewCmdDeleteGateway(newClient cobraFunc) *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			silenceCobra(cmd)
 
-			err := cli.GatewayRemove(context.Background(), deleteGatewayName)
+			err := cli.GatewayRemove(context.Background(), gatewayName)
 			if err != nil {
 				return fmt.Errorf("%w", err)
 			}
-
 			return nil
 		},
 	}
-	cmd.Flags().StringVar(&deleteGatewayName, "name", "", "The name of gateway definition to remove")
+	cmd.Flags().StringVar(&gatewayName, "name", "", "The name of gateway definition to remove")
 	return cmd
 }
-
-var downloadGatewayName string
 
 func NewCmdDownloadGateway(newClient cobraFunc) *cobra.Command {
 	cmd := &cobra.Command{
@@ -933,7 +1144,7 @@ func NewCmdDownloadGateway(newClient cobraFunc) *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			silenceCobra(cmd)
 
-			fileName, err := cli.GatewayDownload(context.Background(), downloadGatewayName, args[0])
+			fileName, err := cli.GatewayDownload(context.Background(), gatewayName, args[0])
 			if err != nil {
 				return fmt.Errorf("%w", err)
 			}
@@ -941,32 +1152,91 @@ func NewCmdDownloadGateway(newClient cobraFunc) *cobra.Command {
 			return nil
 		},
 	}
-	cmd.Flags().StringVar(&downloadGatewayName, "name", "", "The name of gateway definition to download")
+	cmd.Flags().StringVar(&gatewayName, "name", "", "The name of gateway definition to download")
 	return cmd
 }
 
-var gatewayExposeOptions types.GatewayExposeOptions
+func NewCmdExportConfigGateway(newClient cobraFunc) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:    "export-config <export-gateway-name> <output-path>",
+		Short:  "Export the configuration for a gateway definition",
+		Args:   cobra.ExactArgs(2),
+		PreRun: newClient,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			silenceCobra(cmd)
+
+			// TODO: validate args must be non nil, etc.
+			fileName, err := cli.GatewayExportConfig(context.Background(), gatewayName, args[0], args[1])
+			if err != nil {
+				return fmt.Errorf("%w", err)
+			}
+			fmt.Println("Skupper gateway definition configuration written to '" + fileName + "'")
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&gatewayName, "name", "", "The name of target gateway definition to export")
+	return cmd
+}
+
+func NewCmdGenerateBundleGateway(newClient cobraFunc) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:    "generate-bundle <config-file> <output-path>",
+		Short:  "Generate an installation bundle using a gateway config file",
+		Args:   cobra.ExactArgs(2),
+		PreRun: newClient,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			silenceCobra(cmd)
+
+			fileName, err := cli.GatewayGenerateBundle(context.Background(), args[0], args[1])
+			if err != nil {
+				return fmt.Errorf("%w", err)
+			}
+			fmt.Println("Skupper gateway bundle written to '" + fileName + "'")
+			return nil
+		},
+	}
+
+	return cmd
+}
 
 func NewCmdExposeGateway(newClient cobraFunc) *cobra.Command {
 	cmd := &cobra.Command{
-		Use:    "expose <address> <host> <port>",
+		Use:    "expose <address> <host> <port...>",
 		Short:  "Expose a process to the service network (ensure gateway and cluster service)",
 		Args:   exposeGatewayArgs,
 		PreRun: newClient,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			silenceCobra(cmd)
+
+			if gatewayType != "" && gatewayType != "service" && gatewayType != "docker" && gatewayType != "podman" {
+				return fmt.Errorf("%s is not a valid gateway type. Choose 'service', 'docker' or 'podman'.", gatewayType)
+			}
+
 			if len(args) == 2 {
 				parts := strings.Split(args[1], ":")
-				gatewayExposeOptions.Egress.Host = parts[0]
-				gatewayExposeOptions.Egress.Port = parts[1]
+				gatewayEndpoint.Host = parts[0]
+				port, _ := strconv.Atoi(parts[1])
+				gatewayEndpoint.Service.Ports = []int{port}
 			} else {
-				gatewayExposeOptions.Egress.Host = args[1]
-				gatewayExposeOptions.Egress.Port = args[2]
+				tPorts := []int{}
+				sPorts := []int{}
+				for _, v := range args[2:] {
+					ports := strings.Split(v, ":")
+					sPort, _ := strconv.Atoi(ports[0])
+					tPort := sPort
+					if len(ports) == 2 {
+						tPort, _ = strconv.Atoi(ports[1])
+					}
+					sPorts = append(sPorts, sPort)
+					tPorts = append(tPorts, tPort)
+				}
+				gatewayEndpoint.Host = args[1]
+				gatewayEndpoint.Service.Ports = sPorts
+				gatewayEndpoint.TargetPorts = tPorts
 			}
-			gatewayExposeOptions.Egress.Address = args[0]
-			gatewayExposeOptions.Egress.ErrIfNoSvc = false
+			gatewayEndpoint.Service.Address = args[0]
 
-			_, err := cli.GatewayExpose(context.Background(), gatewayExposeOptions)
+			_, err := cli.GatewayExpose(context.Background(), gatewayName, gatewayType, gatewayEndpoint)
 			if err != nil {
 				return fmt.Errorf("%w", err)
 			}
@@ -974,12 +1244,15 @@ func NewCmdExposeGateway(newClient cobraFunc) *cobra.Command {
 			return nil
 		},
 	}
-	cmd.Flags().StringVar(&gatewayExposeOptions.Egress.Protocol, "protocol", "tcp", "The protocol to gateway (tcp, http or http2).")
-	cmd.Flags().StringVar(&gatewayExposeOptions.GatewayName, "name", "", "The name of external service to create. Defaults to service address value")
+	cmd.Flags().StringVar(&gatewayEndpoint.Service.Protocol, "protocol", "tcp", "The protocol to gateway (tcp, http or http2).")
+	cmd.Flags().StringVar(&gatewayEndpoint.Service.Aggregate, "aggregate", "", "The aggregation strategy to use. One of 'json' or 'multipart'. If specified requests to this service will be sent to all registered implementations and the responses aggregated.")
+	cmd.Flags().BoolVar(&gatewayEndpoint.Service.EventChannel, "event-channel", false, "If specified, this service will be a channel for multicast events.")
+	cmd.Flags().StringVarP(&gatewayType, "type", "", "service", "The gateway type one of: 'service', 'docker', 'podman'")
+	cmd.Flags().StringVar(&gatewayName, "name", "", "The name of external service to create. Defaults to service address value")
 	return cmd
 }
 
-var gatewayUnexposeOptions types.GatewayUnexposeOptions
+var deleteLast bool
 
 func NewCmdUnexposeGateway(newClient cobraFunc) *cobra.Command {
 	cmd := &cobra.Command{
@@ -990,8 +1263,8 @@ func NewCmdUnexposeGateway(newClient cobraFunc) *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			silenceCobra(cmd)
 
-			gatewayUnexposeOptions.Address = args[0]
-			err := cli.GatewayUnexpose(context.Background(), gatewayUnexposeOptions)
+			gatewayEndpoint.Service.Address = args[0]
+			err := cli.GatewayUnexpose(context.Background(), gatewayName, gatewayEndpoint, deleteLast)
 			if err != nil {
 				return fmt.Errorf("%w", err)
 			}
@@ -999,16 +1272,14 @@ func NewCmdUnexposeGateway(newClient cobraFunc) *cobra.Command {
 			return nil
 		},
 	}
-	cmd.Flags().StringVar(&gatewayUnexposeOptions.GatewayName, "name", "", "The name of the service process to unexpose")
-	cmd.Flags().BoolVarP(&gatewayUnexposeOptions.DeleteIfLast, "delete-if-last", "", true, "Delete the gateway if no services remain")
+	cmd.Flags().StringVar(&gatewayName, "name", "", "The name of the service process to unexpose")
+	cmd.Flags().BoolVarP(&deleteLast, "delete-last", "", true, "Delete the gateway if no services remain")
 	return cmd
 }
 
-var gatewayBindOptions types.GatewayBindOptions
-
 func NewCmdBindGateway(newClient cobraFunc) *cobra.Command {
 	cmd := &cobra.Command{
-		Use:    "bind <address> <host> <port>",
+		Use:    "bind <address> <host> <port...>",
 		Short:  "Bind a process to the service network",
 		Args:   bindGatewayArgs,
 		PreRun: newClient,
@@ -1016,16 +1287,22 @@ func NewCmdBindGateway(newClient cobraFunc) *cobra.Command {
 			silenceCobra(cmd)
 			if len(args) == 2 {
 				parts := strings.Split(args[1], ":")
-				gatewayBindOptions.Host = parts[0]
-				gatewayBindOptions.Port = parts[1]
+				port, _ := strconv.Atoi(parts[1])
+				gatewayEndpoint.Host = parts[0]
+				gatewayEndpoint.Service.Ports = []int{port}
 			} else {
-				gatewayBindOptions.Host = args[1]
-				gatewayBindOptions.Port = args[2]
+				ports := []int{}
+				for _, p := range args[2:] {
+					port, _ := strconv.Atoi(p)
+					ports = append(ports, port)
+				}
+				gatewayEndpoint.Host = args[1]
+				gatewayEndpoint.Service.Ports = ports
 			}
-			gatewayBindOptions.Address = args[0]
-			gatewayBindOptions.ErrIfNoSvc = true
+			gatewayEndpoint.Service.Address = args[0]
+			gatewayEndpoint.Name = args[0]
 
-			err := cli.GatewayBind(context.Background(), gatewayBindOptions)
+			err := cli.GatewayBind(context.Background(), gatewayName, gatewayEndpoint)
 			if err != nil {
 				return fmt.Errorf("%w", err)
 			}
@@ -1033,12 +1310,17 @@ func NewCmdBindGateway(newClient cobraFunc) *cobra.Command {
 			return nil
 		},
 	}
-	cmd.Flags().StringVar(&gatewayBindOptions.GatewayName, "name", "", "The name of the gateway to bind service")
-	cmd.Flags().StringVar(&gatewayBindOptions.Protocol, "protocol", "tcp", "The protocol to gateway (tcp, http or http2).")
+	cmd.Flags().StringVar(&gatewayName, "name", "", "The name of the gateway to bind service")
+	cmd.Flags().StringVar(&gatewayEndpoint.Service.Protocol, "protocol", "tcp", "The mapping in use for this service address (currently on of tcp, http or http2).")
+	cmd.Flags().StringVar(&gatewayEndpoint.Service.Aggregate, "aggregate", "", "The aggregation strategy to use. One of 'json' or 'multipart'. If specified requests to this service will be sent to all registered implementations and the responses aggregated.")
+	cmd.Flags().BoolVar(&gatewayEndpoint.Service.EventChannel, "event-channel", false, "If specified, this service will be a channel for multicast events.")
+
+	f := cmd.Flag("protocol")
+	f.Deprecated = "This flag is deprecated, protocol is defined by service definition"
+	f.Hidden = true
+
 	return cmd
 }
-
-var gatewayUnbindOptions types.GatewayUnbindOptions
 
 func NewCmdUnbindGateway(newClient cobraFunc) *cobra.Command {
 	cmd := &cobra.Command{
@@ -1049,8 +1331,8 @@ func NewCmdUnbindGateway(newClient cobraFunc) *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			silenceCobra(cmd)
 
-			gatewayUnbindOptions.Address = args[0]
-			err := cli.GatewayUnbind(context.Background(), gatewayUnbindOptions)
+			gatewayEndpoint.Service.Address = args[0]
+			err := cli.GatewayUnbind(context.Background(), gatewayName, gatewayEndpoint)
 			if err != nil {
 				return fmt.Errorf("%w", err)
 			}
@@ -1058,69 +1340,59 @@ func NewCmdUnbindGateway(newClient cobraFunc) *cobra.Command {
 			return nil
 		},
 	}
-	cmd.Flags().StringVar(&gatewayUnbindOptions.GatewayName, "name", "", "The name of the gateway to unbind service")
-	cmd.Flags().StringVar(&gatewayUnbindOptions.Protocol, "protocol", "tcp", "The protocol to gateway (tcp, http or http2).")
+	cmd.Flags().StringVar(&gatewayName, "name", "", "The name of the gateway to unbind service")
+	cmd.Flags().StringVar(&gatewayEndpoint.Service.Protocol, "protocol", "tcp", "The protocol to gateway (tcp, http or http2).")
+
+	f := cmd.Flag("protocol")
+	f.Deprecated = "This flag is deprecated, protocol is defined by service definition"
+	f.Hidden = true
+
 	return cmd
 }
 
 func NewCmdStatusGateway(newClient cobraFunc) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:    "status <gateway-name>",
-		Short:  "Report the status of a gateway to the current skupper site",
+		Short:  "Report the status of the gateway(s) for the current skupper site",
 		Args:   cobra.MaximumNArgs(1),
 		PreRun: newClient,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			silenceCobra(cmd)
 
-			if len(args) == 1 && args[0] != "all" {
-				gatewayName := args[0]
-				inspect, err := cli.GatewayInspect(context.Background(), gatewayName)
-				if err != nil {
-					return fmt.Errorf("%w", err)
-				}
-
-				fmt.Printf("%-30s %s\n", "Name", inspect.GatewayName)
-				fmt.Printf("%-30s %s\n", "Version", strings.TrimSuffix(inspect.GatewayVersion, "\n"))
-				fmt.Printf("%-30s %s\n", "URL", inspect.GatewayUrl)
-
-				fmt.Println("")
-
-				if len(inspect.TcpConnectors) == 0 && len(inspect.TcpListeners) == 0 {
-					fmt.Println("No Services Defined")
-				} else {
-					fmt.Println("Service Definitions:")
-					tw := new(tabwriter.Writer)
-					tw.Init(os.Stdout, 0, 4, 1, ' ', 0)
-					fmt.Fprintln(tw, fmt.Sprintf("%s\t%s\t%s\t%s\t%s\t%s\t", "TYPE", "SERVICE", "ADDRESS", "HOST", "PORT", "FORWARD_PORT"))
-					for _, connector := range inspect.TcpConnectors {
-						fmt.Fprintln(tw, fmt.Sprintf("%s\t%s\t%s\t%s\t%s\t%s\t", "bind", strings.TrimPrefix(connector.Name, gatewayName+"-egress-"), connector.Address, connector.Host, connector.Port, ""))
-					}
-					for _, listener := range inspect.TcpListeners {
-						fmt.Fprintln(tw, fmt.Sprintf("%s\t%s\t%s\t%s\t%s\t%s\t", "forward", strings.TrimPrefix(listener.Name, gatewayName+"-ingress-"), listener.Address, listener.Host, listener.Port, listener.LocalPort))
-					}
-					tw.Flush()
-				}
-			} else {
-				gateways, err := cli.GatewayList(context.Background())
-				if err != nil {
-					return fmt.Errorf("%w", err)
-				}
-
-				if len(gateways) == 0 {
-					fmt.Println("No gateway definitions found")
-					return nil
-				}
-
-				fmt.Println("Gateway Definitions Summary")
-				fmt.Println("")
-				tw := new(tabwriter.Writer)
-				tw.Init(os.Stdout, 0, 4, 2, ' ', 0)
-				fmt.Fprintln(tw, fmt.Sprintf("%s\t%s\t%s\t%s\t", "NAME", "BINDS", "FORWARDS", "URL"))
-				for _, gateway := range gateways {
-					fmt.Fprintln(tw, fmt.Sprintf("%s\t%s\t%s\t%s\t", gateway.GatewayName, strconv.Itoa(len(gateway.TcpConnectors)), strconv.Itoa(len(gateway.TcpListeners)), gateway.GatewayUrl))
-				}
-				tw.Flush()
+			gateways, err := cli.GatewayList(context.Background())
+			if err != nil {
+				return fmt.Errorf("%w", err)
 			}
+
+			if len(gateways) == 0 {
+				fmt.Println("No gateway definitions found")
+				return nil
+			}
+
+			l := formatter.NewList()
+			l.Item("Gateway Definitions:")
+			for _, gateway := range gateways {
+				item := ""
+				if gateway.GatewayType == client.GatewayExportType {
+					item = fmt.Sprintf("%s type: %s", gateway.GatewayName, gateway.GatewayType)
+				} else {
+					item = fmt.Sprintf("%s type: %s version: %s url: %s", gateway.GatewayName, gateway.GatewayType, strings.TrimSuffix(gateway.GatewayVersion, "\n"), gateway.GatewayUrl)
+				}
+				gw := l.NewChild(item)
+				if len(gateway.GatewayConnectors) > 0 {
+					listeners := gw.NewChild("Bindings:")
+					for _, connector := range gateway.GatewayConnectors {
+						listeners.NewChild(fmt.Sprintf("%s %s %s %s %d", strings.TrimPrefix(connector.Name, gateway.GatewayName+"-egress-"), connector.Service.Protocol, connector.Service.Address, connector.Host, connector.Service.Ports[0]))
+					}
+				}
+				if len(gateway.GatewayListeners) > 0 {
+					listeners := gw.NewChild("Forwards:")
+					for _, listener := range gateway.GatewayListeners {
+						listeners.NewChild(fmt.Sprintf("%s %s %s %s %d:%s", strings.TrimPrefix(listener.Name, gateway.GatewayName+"-ingress-"), listener.Service.Protocol, listener.Service.Address, listener.Host, listener.Service.Ports[0], listener.LocalPort))
+					}
+				}
+			}
+			l.Print()
 
 			return nil
 		},
@@ -1129,26 +1401,30 @@ func NewCmdStatusGateway(newClient cobraFunc) *cobra.Command {
 	return cmd
 }
 
-var gatewayForwardOptions types.GatewayForwardOptions
+var forwardLoopback bool
 
 func NewCmdForwardGateway(newClient cobraFunc) *cobra.Command {
 	cmd := &cobra.Command{
-		Use:    "forward <address> <port>",
+		Use:    "forward <address> <port...>",
 		Short:  "Forward an address to the service network",
-		Args:   cobra.ExactArgs(2),
+		Args:   cobra.MinimumNArgs(2),
 		PreRun: newClient,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			silenceCobra(cmd)
 
-			forwardPort, err := strconv.Atoi(args[1])
-			if err != nil {
-				return fmt.Errorf("%s is not a valid forward port", args[1])
+			ports := []int{}
+			for _, p := range args[1:] {
+				port, err := strconv.Atoi(p)
+				if err != nil {
+					return fmt.Errorf("%s is not a valid forward port", p)
+				}
+				ports = append(ports, port)
 			}
 
-			gatewayForwardOptions.Service.Address = args[0]
-			gatewayForwardOptions.Service.Port = forwardPort
+			gatewayEndpoint.Service.Address = args[0]
+			gatewayEndpoint.Service.Ports = ports
 
-			err = cli.GatewayForward(context.Background(), gatewayForwardOptions)
+			err := cli.GatewayForward(context.Background(), gatewayName, gatewayEndpoint, forwardLoopback)
 			if err != nil {
 				return fmt.Errorf("%w", err)
 			}
@@ -1156,15 +1432,13 @@ func NewCmdForwardGateway(newClient cobraFunc) *cobra.Command {
 			return nil
 		},
 	}
-	cmd.Flags().StringVar(&gatewayForwardOptions.GatewayName, "name", "", "The name of the gateway to service forward")
-	cmd.Flags().StringVar(&gatewayForwardOptions.Service.Protocol, "mapping", "tcp", "The mapping in use for this service address (currently one of tcp or http)")
-	cmd.Flags().StringVar(&gatewayForwardOptions.Service.Aggregate, "aggregate", "", "The aggregation strategy to use. One of 'json' or 'multipart'. If specified requests to this service will be sent to all registered implementations and the responses aggregated.")
-	cmd.Flags().BoolVar(&gatewayForwardOptions.Service.EventChannel, "event-channel", false, "If specified, this service will be a channel for multicast events.")
-	cmd.Flags().BoolVarP(&gatewayForwardOptions.Loopback, "loopback", "", false, "Forward from loopback only")
+	cmd.Flags().StringVar(&gatewayName, "name", "", "The name of the gateway to service forward")
+	cmd.Flags().StringVar(&gatewayEndpoint.Service.Protocol, "protocol", "tcp", "The mapping in use for this service address (currently one of tcp, http or http2)")
+	cmd.Flags().StringVar(&gatewayEndpoint.Service.Aggregate, "aggregate", "", "The aggregation strategy to use. One of 'json' or 'multipart'. If specified requests to this service will be sent to all registered implementations and the responses aggregated.")
+	cmd.Flags().BoolVar(&gatewayEndpoint.Service.EventChannel, "event-channel", false, "If specified, this service will be a channel for multicast events.")
+	cmd.Flags().BoolVarP(&forwardLoopback, "loopback", "", false, "Forward from loopback only")
 	return cmd
 }
-
-var unforwardGatewayName string
 
 func NewCmdUnforwardGateway(newClient cobraFunc) *cobra.Command {
 	cmd := &cobra.Command{
@@ -1175,7 +1449,8 @@ func NewCmdUnforwardGateway(newClient cobraFunc) *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			silenceCobra(cmd)
 
-			err := cli.GatewayUnforward(context.Background(), unforwardGatewayName, args[0])
+			gatewayEndpoint.Service.Address = args[0]
+			err := cli.GatewayUnforward(context.Background(), gatewayName, gatewayEndpoint)
 			if err != nil {
 				return fmt.Errorf("%w", err)
 			}
@@ -1183,8 +1458,8 @@ func NewCmdUnforwardGateway(newClient cobraFunc) *cobra.Command {
 			return nil
 		},
 	}
-	cmd.Flags().StringVar(&unforwardGatewayName, "name", "", "The name of the gateway to disable service forward")
-	cmd.Flags().StringVar(&protocol, "protocol", "tcp", "The protocol to gateway (tcp, http or http2).")
+	cmd.Flags().StringVar(&gatewayName, "name", "", "The name of the gateway to disable service forward")
+	cmd.Flags().StringVar(&gatewayEndpoint.Service.Protocol, "protocol", "tcp", "The protocol to gateway (tcp, http or http2).")
 	return cmd
 }
 
@@ -1308,6 +1583,7 @@ func init() {
 	cmdCreateService := NewCmdCreateService(newClient)
 	cmdDeleteService := NewCmdDeleteService(newClient)
 	cmdStatusService := NewCmdServiceStatus(newClient)
+	cmdLabelsService := NewCmdServiceLabel(newClient)
 	cmdBind := NewCmdBind(newClient)
 	cmdUnbind := NewCmdUnbind(newClient)
 	cmdVersion := NewCmdVersion(newClientSansExit)
@@ -1315,6 +1591,8 @@ func init() {
 
 	cmdInitGateway := NewCmdInitGateway(newClient)
 	cmdDownloadGateway := NewCmdDownloadGateway(newClient)
+	cmdExportConfigGateway := NewCmdExportConfigGateway(newClient)
+	cmdGenerateBundleGateway := NewCmdGenerateBundleGateway(newClient)
 	cmdDeleteGateway := NewCmdDeleteGateway(newClient)
 	cmdExposeGateway := NewCmdExposeGateway(newClient)
 	cmdUnexposeGateway := NewCmdUnexposeGateway(newClient)
@@ -1324,14 +1602,14 @@ func init() {
 	cmdForwardGateway := NewCmdForwardGateway(newClient)
 	cmdUnforwardGateway := NewCmdUnforwardGateway(newClient)
 
-	//backwards compatibility commands hidden
+	// backwards compatibility commands hidden
 	deprecatedMessage := "please use 'skupper service [bind|unbind]' instead"
 	cmdBind.Hidden = true
 	cmdBind.Deprecated = deprecatedMessage
 	cmdUnbind.Deprecated = deprecatedMessage
 	cmdUnbind.Hidden = true
 
-	cmdListConnectors := NewCmdListConnectors(newClient) //listconnectors just keeped
+	cmdListConnectors := NewCmdListConnectors(newClient) // listconnectors just keeped
 	cmdListConnectors.Hidden = true
 	cmdListConnectors.Deprecated = "please use 'skupper link status'"
 
@@ -1356,6 +1634,9 @@ func init() {
 	cmdListExposed.Hidden = true
 	cmdListExposed.Deprecated = "please use 'skupper service status' instead."
 
+	cmdDownloadGateway.Hidden = true
+	cmdDownloadGateway.Deprecated = "please use 'skupper gateway export-config' instead."
+
 	// setup subcommands
 	cmdService := NewCmdService()
 	cmdService.AddCommand(cmdCreateService)
@@ -1363,10 +1644,13 @@ func init() {
 	cmdService.AddCommand(NewCmdBind(newClient))
 	cmdService.AddCommand(NewCmdUnbind(newClient))
 	cmdService.AddCommand(cmdStatusService)
+	cmdService.AddCommand(cmdLabelsService)
 
 	cmdGateway := NewCmdGateway()
 	cmdGateway.AddCommand(cmdInitGateway)
 	cmdGateway.AddCommand(cmdDownloadGateway)
+	cmdGateway.AddCommand(cmdExportConfigGateway)
+	cmdGateway.AddCommand(cmdGenerateBundleGateway)
 	cmdGateway.AddCommand(cmdDeleteGateway)
 	cmdGateway.AddCommand(cmdExposeGateway)
 	cmdGateway.AddCommand(cmdUnexposeGateway)

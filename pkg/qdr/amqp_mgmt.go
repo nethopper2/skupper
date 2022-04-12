@@ -7,7 +7,6 @@ import (
 	"fmt"
 	amqp "github.com/interconnectedcloud/go-amqp"
 	"log"
-	"strconv"
 	"strings"
 	"time"
 )
@@ -722,62 +721,64 @@ func getBridgeTypes() []string {
 	}
 }
 
-func (a *Agent) GetLocalTcpListener(address string, port int) (*TcpEndpoint, error) {
-	results, err := a.Query("org.apache.qpid.dispatch.tcpListener", []string{})
-	if err != nil {
-		return nil, err
-	}
-	for _, record := range results {
-		listener := asTcpEndpoint(record)
-		if listener.Port == strconv.Itoa(port) || listener.Address == address {
-			return &listener, nil
+type TcpEndpointFilter func(*TcpEndpoint) bool
+
+func asTcpEndpoints(records []Record, filter TcpEndpointFilter) []TcpEndpoint {
+	endpoints := []TcpEndpoint{}
+	for _, record := range records {
+		endpoint := asTcpEndpoint(record)
+		if filter == nil || filter(&endpoint) {
+			endpoints = append(endpoints, endpoint)
 		}
 	}
-	return nil, nil
+	return endpoints
 }
 
-func (a *Agent) GetLocalHttpListener(address string, port int) (*HttpEndpoint, error) {
-	results, err := a.Query("org.apache.qpid.dispatch.httpListener", []string{})
+func (a *Agent) getLocalTcpEndpoints(typename string, filter TcpEndpointFilter) ([]TcpEndpoint, error) {
+	results, err := a.Query(typename, []string{})
 	if err != nil {
 		return nil, err
 	}
-	for _, record := range results {
-		listener := asHttpEndpoint(record)
-		if listener.Port == strconv.Itoa(port) || listener.Address == address {
-			return &listener, nil
-		}
-	}
-	return nil, nil
+	records := asTcpEndpoints(results, filter)
+	return records, nil
 }
 
-func (a *Agent) GetLocalTcpConnectors(address string) ([]TcpEndpoint, error) {
-	results, err := a.Query("org.apache.qpid.dispatch.tcpConnector", []string{})
-	if err != nil {
-		return nil, err
-	}
-	matched := []TcpEndpoint{}
-	for _, record := range results {
-		connector := asTcpEndpoint(record)
-		if connector.Address == address {
-			matched = append(matched, connector)
+type HttpEndpointFilter func(*HttpEndpoint) bool
+
+func asHttpEndpoints(records []Record, filter HttpEndpointFilter) []HttpEndpoint {
+	endpoints := []HttpEndpoint{}
+	for _, record := range records {
+		endpoint := asHttpEndpoint(record)
+		if filter == nil || filter(&endpoint) {
+			endpoints = append(endpoints, endpoint)
 		}
 	}
-	return matched, nil
+	return endpoints
 }
 
-func (a *Agent) GetLocalHttpConnectors(address string) ([]HttpEndpoint, error) {
-	results, err := a.Query("org.apache.qpid.dispatch.httpConnector", []string{})
+func (a *Agent) getLocalHttpEndpoints(typename string, filter HttpEndpointFilter) ([]HttpEndpoint, error) {
+	results, err := a.Query(typename, []string{})
 	if err != nil {
 		return nil, err
 	}
-	matched := []HttpEndpoint{}
-	for _, record := range results {
-		connector := asHttpEndpoint(record)
-		if connector.Address == address {
-			matched = append(matched, connector)
-		}
-	}
-	return matched, nil
+	records := asHttpEndpoints(results, filter)
+	return records, nil
+}
+
+func (a *Agent) GetLocalTcpListeners(filter TcpEndpointFilter) ([]TcpEndpoint, error) {
+	return a.getLocalTcpEndpoints("org.apache.qpid.dispatch.tcpListener", filter)
+}
+
+func (a *Agent) GetLocalHttpListeners(filter HttpEndpointFilter) ([]HttpEndpoint, error) {
+	return a.getLocalHttpEndpoints("org.apache.qpid.dispatch.httpListener", filter)
+}
+
+func (a *Agent) GetLocalTcpConnectors(filter TcpEndpointFilter) ([]TcpEndpoint, error) {
+	return a.getLocalTcpEndpoints("org.apache.qpid.dispatch.tcpConnector", filter)
+}
+
+func (a *Agent) GetLocalHttpConnectors(filter HttpEndpointFilter) ([]HttpEndpoint, error) {
+	return a.getLocalHttpEndpoints("org.apache.qpid.dispatch.httpConnector", filter)
 }
 
 func (a *Agent) GetLocalBridgeConfig() (*BridgeConfig, error) {
@@ -1056,6 +1057,26 @@ func (a *Agent) getEdgeRouters(agent string) ([]Router, error) {
 	return edges, nil
 }
 
+func (a *Agent) GetLocalGateways() ([]Router, error) {
+	gateways := []Router{}
+	connections, err := a.GetConnections()
+	if err != nil {
+		return gateways, err
+	}
+	for _, c := range connections {
+		if c.Role == "edge" && c.Dir == DirectionIn && isGateway(c.Container) {
+			router := Router{
+				Id:      c.Container,
+				Edge:    true,
+				Address: getRouterAddress(c.Container, true),
+			}
+			gateways = append(gateways, router)
+		}
+	}
+	err = a.getSiteIds(gateways)
+	return gateways, err
+}
+
 func (a *Agent) GetLocalRouter() (*Router, error) {
 	records, err := a.Query("org.apache.qpid.dispatch.router", []string{})
 	if err != nil {
@@ -1083,6 +1104,41 @@ func (a *Agent) getInteriorAddressForUplink() (string, error) {
 		}
 	}
 	return "", fmt.Errorf("Could not find uplink connection")
+}
+
+type ConnectorStatus struct {
+	Name        string
+	Host        string
+	Port        string
+	Role        string
+	Cost        int
+	Status      string
+	Description string
+}
+
+func asConnectorStatus(record Record) ConnectorStatus {
+	return ConnectorStatus{
+		Name:        record.AsString("name"),
+		Host:        record.AsString("host"),
+		Port:        record.AsString("port"),
+		Role:        record.AsString("role"),
+		Cost:        record.AsInt("cost"),
+		Status:      record.AsString("connectionStatus"),
+		Description: record.AsString("connectionMsg"),
+	}
+}
+
+func (a *Agent) GetLocalConnectorStatus() (map[string]ConnectorStatus, error) {
+	results, err := a.Query("org.apache.qpid.dispatch.connector", []string{})
+	if err != nil {
+		return nil, err
+	}
+	connectors := map[string]ConnectorStatus{}
+	for _, record := range results {
+		c := asConnectorStatus(record)
+		connectors[c.Name] = c
+	}
+	return connectors, nil
 }
 
 func (a *Agent) Request(request *Request) (*Response, error) {
@@ -1134,4 +1190,16 @@ func (a *Agent) Request(request *Request) (*Response, error) {
 		response.Body = body
 	}
 	return &response, nil
+}
+
+func (r *Router) IsGateway() bool {
+	return isGateway(r.Id)
+}
+
+func isGateway(routerId string) bool {
+	return strings.HasPrefix(routerId, "gateway-")
+}
+
+func GetSiteNameForGateway(gateway *Router) string {
+	return strings.TrimPrefix(gateway.Id, "gateway-")
 }

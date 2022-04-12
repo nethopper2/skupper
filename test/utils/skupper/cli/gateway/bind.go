@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/skupperproject/skupper/api/types"
@@ -16,7 +17,7 @@ import (
 type BindTester struct {
 	Address         string
 	Host            string
-	Port            string
+	EgressPort      []string
 	Name            string
 	Protocol        string
 	IsGatewayActive bool
@@ -24,7 +25,8 @@ type BindTester struct {
 
 func (b *BindTester) Command(cluster *base.ClusterContext) []string {
 	args := cli.SkupperCommonOptions(cluster)
-	args = append(args, "gateway", "bind", b.Address, b.Host, b.Port)
+	args = append(args, "gateway", "bind", b.Address, b.Host)
+	args = append(args, b.EgressPort...)
 
 	if b.Name != "" {
 		args = append(args, "--name", b.Name)
@@ -43,17 +45,27 @@ func (b *BindTester) Run(cluster *base.ClusterContext) (stdout string, stderr st
 		return
 	}
 
-	// Basic validation of the stdout (only when gateway is active)
-	matched, _ := regexp.MatchString(fmt.Sprintf(`.* CREATE .*%s .*%s`, b.Address, b.Port), stderr)
-	if !b.IsGatewayActive && !matched {
-		// Sample output
-		// 2021/07/28 14:10:49 CREATE org.apache.qpid.dispatch.tcpConnector localhost.localdomain-user-egress-tcp-go-host map[address:tcp-go-host host:0.0.0.0 name:localhost.localdomain-user-egress-tcp-go-host port:9090]
-		err = fmt.Errorf("output does not contain expected content - found: %s", stdout)
+	// Retrieving service info
+	ctx := context.Background()
+	var si *types.ServiceInterface
+	si, err = cluster.VanClient.ServiceInterfaceInspect(ctx, b.Address)
+	if err != nil {
 		return
 	}
 
+	// Basic validation of the stdout (only when gateway is active)
+	for _, ingressPort := range si.Ports {
+		expectedOut := fmt.Sprintf(`.* CREATE .*%s:%d .*%s`, b.Address, ingressPort, b.EgressPort)
+		matched, _ := regexp.MatchString(expectedOut, stderr)
+		if b.IsGatewayActive && !matched {
+			// Sample output
+			// 2021/10/26 17:10:25 CREATE org.apache.qpid.dispatch.tcpConnector fgiorget-fgiorget-egress-tcp-echo-host:9090 map[address:tcp-echo-host:9090 host:0.0.0.0 name:fgiorget-fgiorget-egress-tcp-echo-host:9090 port:46173 siteId:ee953910-681a-4bc5-b139-78bbbe45f6b3]
+			err = fmt.Errorf("output does not contain expected content - found: %s", stderr)
+			return
+		}
+	}
+
 	// Validating service bind definition
-	ctx := context.Background()
 	gwList, err := cluster.VanClient.GatewayList(ctx)
 
 	gwName := b.Name
@@ -72,25 +84,27 @@ func (b *BindTester) Run(cluster *base.ClusterContext) (stdout string, stderr st
 		// finding the correct connector
 		var bind types.GatewayEndpoint
 		found := false
-		for k, v := range gw.TcpConnectors {
-			if strings.HasSuffix(k, b.Address) {
-				bind = v
-				found = true
-				break
+		for i, ingressPort := range si.Ports {
+			for k, v := range gw.GatewayConnectors {
+				if strings.Contains(k, b.Address+":"+strconv.Itoa(ingressPort)) {
+					bind = v
+					found = true
+					break
+				}
 			}
-		}
-		if !found {
-			err = fmt.Errorf("service bind not bound")
-			return
-		}
-		if bind.Address != b.Address {
-			err = fmt.Errorf("service address is incorrect - expected: %s - found: %s", b.Address, bind.Address)
-		}
-		if bind.Port != b.Port {
-			err = fmt.Errorf("service port is incorrect - expected: %s - found: %s", b.Port, bind.Port)
-		}
-		if bind.Host != b.Host {
-			err = fmt.Errorf("service host is incorrect - expected: %s - found: %s", b.Host, bind.Host)
+			if !found {
+				err = fmt.Errorf("service bind not found")
+				return
+			}
+			if bind.Service.Address != fmt.Sprintf("%s:%d", b.Address, ingressPort) {
+				err = fmt.Errorf("service address is incorrect - expected: %s:%d - found: %s", b.Address, ingressPort, bind.Service.Address)
+			}
+			if strconv.Itoa(bind.Service.Ports[i]) != b.EgressPort[i] {
+				err = fmt.Errorf("service port is incorrect - expected: %s - found: %d", b.EgressPort[i], bind.Service.Ports[i])
+			}
+			if bind.Host != b.Host {
+				err = fmt.Errorf("service host is incorrect - expected: %s - found: %s", b.Host, bind.Host)
+			}
 		}
 	}
 

@@ -8,4 +8,14 @@ type Site struct {
 	Namespace string   `json:"namespace"`
 	Url       string   `json:"url"`
 	Edge      bool     `json:"edge"`
+	Gateway   bool     `json:"gateway"`
+}
+
+func (s *Site) IsConnectedTo(siteId string) bool {
+	for _, value := range s.Connected {
+		if value == siteId {
+			return true
+		}
+	}
+	return false
 }

@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"strconv"
+	"reflect"
 	"strings"
 	"time"
 
@@ -41,12 +41,12 @@ type Controller struct {
 	svcInformer       cache.SharedIndexInformer
 	headlessInformer  cache.SharedIndexInformer
 
-	//control loop state:
+	// control loop state:
 	events   workqueue.RateLimitingInterface
 	bindings map[string]*ServiceBindings
 	ports    *FreePorts
 
-	//service_sync state:
+	// service_sync state:
 	disableServiceSync bool
 	tlsConfig          *tls.Config
 	amqpClient         *amqp.Client
@@ -60,7 +60,6 @@ type Controller struct {
 	definitionMonitor *DefinitionMonitor
 	consoleServer     *ConsoleServer
 	siteQueryServer   *SiteQueryServer
-	configSync        *ConfigSync
 	claimVerifier     *ClaimVerifier
 	tokenHandler      *SecretController
 	claimHandler      *SecretController
@@ -190,7 +189,6 @@ func NewController(cli *client.VanClient, origin string, tlsConfig *tls.Config, 
 	controller.siteQueryServer = newSiteQueryServer(cli, tlsConfig)
 
 	controller.definitionMonitor = newDefinitionMonitor(controller.origin, controller.vanClient, controller.svcDefInformer, controller.svcInformer)
-	controller.configSync = newConfigSync(controller.bridgeDefInformer, tlsConfig)
 	if enableClaimVerifier() {
 		controller.claimVerifier = newClaimVerifier(controller.vanClient)
 	}
@@ -312,7 +310,6 @@ func (c *Controller) Run(stopCh <-chan struct{}) error {
 	c.definitionMonitor.start(stopCh)
 	c.siteQueryServer.start(stopCh)
 	c.consoleServer.start(stopCh)
-	c.configSync.start(stopCh)
 	if c.claimVerifier != nil {
 		c.claimVerifier.start(stopCh)
 	}
@@ -322,7 +319,6 @@ func (c *Controller) Run(stopCh <-chan struct{}) error {
 	log.Println("Started workers")
 	<-stopCh
 	log.Println("Shutting down workers")
-	c.configSync.stop()
 	c.definitionMonitor.stop()
 	c.tokenHandler.stop()
 	c.claimHandler.stop()
@@ -332,7 +328,7 @@ func (c *Controller) Run(stopCh <-chan struct{}) error {
 
 func (c *Controller) createServiceFor(desired *ServiceBindings) error {
 	event.Recordf(ServiceControllerCreateEvent, "Creating new service for %s", desired.address)
-	_, err := kube.NewServiceForAddress(desired.address, desired.publicPort, desired.ingressPort, getOwnerReference(), c.vanClient.Namespace, c.vanClient.KubeClient)
+	_, err := kube.NewServiceForAddress(desired.address, desired.publicPorts, desired.ingressPorts, desired.labels, getOwnerReference(), c.vanClient.Namespace, c.vanClient.KubeClient)
 	if err != nil {
 		event.Recordf(ServiceControllerError, "Error while creating service %s: %s", desired.address, err)
 	}
@@ -341,7 +337,7 @@ func (c *Controller) createServiceFor(desired *ServiceBindings) error {
 
 func (c *Controller) createHeadlessServiceFor(desired *ServiceBindings) error {
 	event.Recordf(ServiceControllerCreateEvent, "Creating new headless service for %s", desired.address)
-	_, err := kube.NewHeadlessServiceForAddress(desired.address, desired.publicPort, desired.ingressPort, getOwnerReference(), c.vanClient.Namespace, c.vanClient.KubeClient)
+	_, err := kube.NewHeadlessServiceForAddress(desired.address, desired.publicPorts, desired.ingressPorts, desired.labels, getOwnerReference(), c.vanClient.Namespace, c.vanClient.KubeClient)
 	if err != nil {
 		event.Recordf(ServiceControllerError, "Error while creating headless service %s: %s", desired.address, err)
 	}
@@ -368,26 +364,50 @@ func equivalentSelectors(a map[string]string, b map[string]string) bool {
 func (c *Controller) checkServiceFor(desired *ServiceBindings, actual *corev1.Service) error {
 	event.Recordf(ServiceControllerEvent, "Checking service changes for %s", actual.ObjectMeta.Name)
 	update := false
-	if len(actual.Spec.Ports) > 0 {
-		if actual.Spec.Ports[0].Port != int32(desired.publicPort) {
+
+	desiredPorts := desired.PortMap()
+
+	// adding or updating ports
+	actualPorts := kube.GetServicePortMap(actual)
+	originalAssignedPorts := kube.GetOriginalAssignedPorts(actual)
+	var ports []corev1.ServicePort
+
+	for pPort, iPort := range desiredPorts {
+		actualIngPort, found := actualPorts[pPort]
+		if !found {
 			update = true
-			actual.Spec.Ports[0].Port = int32(desired.publicPort)
-		}
-		if actual.Spec.Ports[0].TargetPort.IntValue() != desired.ingressPort {
+			ports = append(ports, corev1.ServicePort{
+				Name:       fmt.Sprintf("port%d", pPort),
+				Port:       int32(pPort),
+				TargetPort: intstr.IntOrString{IntVal: int32(iPort)},
+			})
+		} else if actualIngPort != iPort {
 			update = true
-			originalAssignedPort, _ := strconv.Atoi(actual.Annotations[types.OriginalAssignedQualifier])
-			actualTargetPort := actual.Spec.Ports[0].TargetPort.IntValue()
-			if actual.ObjectMeta.Annotations == nil {
-				actual.ObjectMeta.Annotations = map[string]string{}
-			}
-			// If target port has been modified by user
-			if actualTargetPort != originalAssignedPort {
-				actual.ObjectMeta.Annotations[types.OriginalTargetPortQualifier] = strconv.Itoa(actualTargetPort)
-			}
-			actual.ObjectMeta.Annotations[types.OriginalAssignedQualifier] = strconv.Itoa(desired.ingressPort)
-			actual.Spec.Ports[0].TargetPort = intstr.FromInt(desired.ingressPort)
+			port := kube.GetServicePort(actual, pPort)
+			port.TargetPort = intstr.IntOrString{IntVal: int32(iPort)}
+			ports = append(ports, *port)
 		}
 	}
+
+	// updating annotations
+	if update {
+		if actual.ObjectMeta.Annotations == nil {
+			actual.ObjectMeta.Annotations = map[string]string{}
+		}
+		// If target port has been modified by user
+		if !reflect.DeepEqual(actualPorts, originalAssignedPorts) {
+			actual.ObjectMeta.Annotations[types.OriginalTargetPortQualifier] = kube.PortMapToLabelStr(actualPorts)
+		}
+		actual.ObjectMeta.Annotations[types.OriginalAssignedQualifier] = kube.PortMapToLabelStr(desiredPorts)
+	}
+
+	// removing ports
+	for pPort, _ := range actualPorts {
+		if _, found := desiredPorts[pPort]; !found {
+			update = true
+		}
+	}
+
 	if desired.headless == nil && !equivalentSelectors(actual.Spec.Selector, kube.GetLabelsForRouter()) {
 		update = true
 		if actual.ObjectMeta.Annotations == nil {
@@ -399,7 +419,19 @@ func (c *Controller) checkServiceFor(desired *ServiceBindings, actual *corev1.Se
 		}
 		actual.Spec.Selector = kube.GetLabelsForRouter()
 	}
+	if !reflect.DeepEqual(desired.labels, actual.Labels) {
+		update = true
+		if actual.Labels == nil {
+			actual.Labels = map[string]string{}
+		}
+		for k, v := range desired.labels {
+			actual.Labels[k] = v
+		}
+	}
 	if update {
+		if len(ports) > 0 {
+			actual.Spec.Ports = ports
+		}
 		_, err := c.vanClient.KubeClient.CoreV1().Services(c.vanClient.Namespace).Update(actual)
 		return err
 	}
@@ -540,7 +572,7 @@ func (c *Controller) updateBridgeConfig(name string) error {
 	if err != nil {
 		return fmt.Errorf("Error reading skupper-internal from cache: %s", err)
 	} else if !exists {
-		return fmt.Errorf("skupper-internal does not exist: %v", err.Error())
+		return fmt.Errorf("skupper-internal does not exist")
 	} else {
 		cm, ok := obj.(*corev1.ConfigMap)
 		if !ok {
@@ -562,23 +594,23 @@ func (c *Controller) updateBridgeConfig(name string) error {
 	return nil
 }
 
-func (c *Controller) initialiseServiceBindingsMap() (map[string]int, error) {
+func (c *Controller) initialiseServiceBindingsMap() (map[string][]int, error) {
 	c.bindings = map[string]*ServiceBindings{}
-	//on first initiliasing the service bindings map, need to get any
-	//port allocations from bridge config
+	// on first initiliasing the service bindings map, need to get any
+	// port allocations from bridge config
 	bridges, err := c.getInitialBridgeConfig()
 	if err != nil {
 		return nil, err
 	}
 	allocations := c.ports.getPortAllocations(bridges)
-	//TODO: should deduce the ports in use by the router by
-	//reading config rather than hardcoding them here
+	// TODO: should deduce the ports in use by the router by
+	// reading config rather than hardcoding them here
 	c.ports.inuse(int(types.AmqpDefaultPort))
 	c.ports.inuse(int(types.AmqpsDefaultPort))
 	c.ports.inuse(int(types.EdgeListenerPort))
 	c.ports.inuse(int(types.InterRouterListenerPort))
 	c.ports.inuse(int(types.ConsoleDefaultServicePort))
-	c.ports.inuse(9090) //currently hardcoded in config
+	c.ports.inuse(9090) // currently hardcoded in config
 	return allocations, nil
 
 }
@@ -658,12 +690,12 @@ func (c *Controller) processNextEvent() bool {
 			switch category {
 			case "servicedefs":
 				event.Record(ServiceControllerEvent, "Service definitions have changed")
-				//get the configmap, parse the json, check against the current servicebindings map
+				// get the configmap, parse the json, check against the current servicebindings map
 				obj, exists, err := c.svcDefInformer.GetStore().GetByKey(name)
 				if err != nil {
 					return fmt.Errorf("Error reading skupper-services from cache: %s", err)
 				} else if exists {
-					var portAllocations map[string]int
+					var portAllocations map[string][]int
 					if c.bindings == nil {
 						portAllocations, err = c.initialiseServiceBindingsMap()
 						if err != nil {
@@ -702,7 +734,7 @@ func (c *Controller) processNextEvent() bool {
 				c.updateHeadlessProxies()
 			case "bridges":
 				if c.bindings == nil {
-					//not yet initialised
+					// not yet initialised
 					return nil
 				}
 				err := c.updateBridgeConfig(name)
@@ -711,11 +743,11 @@ func (c *Controller) processNextEvent() bool {
 				}
 			case "actual-services":
 				if c.bindings == nil {
-					//not yet initialised
+					// not yet initialised
 					return nil
 				}
 				event.Recordf(ServiceControllerEvent, "service event for %s", name)
-				//name is fully qualified name of the actual service
+				// name is fully qualified name of the actual service
 				obj, exists, err := c.svcInformer.GetStore().GetByKey(name)
 				if err != nil {
 					return fmt.Errorf("Error reading service %s from cache: %s", name, err)
@@ -733,7 +765,7 @@ func (c *Controller) processNextEvent() bool {
 							}
 						}
 					} else {
-						//check that service matches binding def, else update it
+						// check that service matches binding def, else update it
 						err = c.checkServiceFor(bindings, svc)
 						if err != nil {
 							return err
@@ -758,7 +790,7 @@ func (c *Controller) processNextEvent() bool {
 				}
 			case "targetpods":
 				event.Recordf(ServiceControllerEvent, "Got targetpods event %s", name)
-				//name is the address of the skupper service
+				// name is the address of the skupper service
 				c.updateBridgeConfig(c.namespaced(types.TransportConfigMapName))
 			case "statefulset":
 				event.Recordf(ServiceControllerEvent, "Got statefulset proxy event %s", name)

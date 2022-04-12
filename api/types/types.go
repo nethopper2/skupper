@@ -15,6 +15,8 @@ limitations under the License.
 package types
 
 import (
+	jsonencoding "encoding/json"
+
 	routev1 "github.com/openshift/api/route/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
@@ -63,7 +65,7 @@ var TransportPolicyRule = []rbacv1.PolicyRule{
 	{
 		Verbs:     []string{"get", "list", "watch"},
 		APIGroups: []string{""},
-		Resources: []string{"pods"},
+		Resources: []string{"pods", "configmaps"},
 	},
 }
 
@@ -120,7 +122,7 @@ const (
 	SiteServerSecret         string = "skupper-site-server"
 	ClaimsServerSecret       string = "skupper-claims-server"
 	SiteCaSecret             string = "skupper-site-ca"
-	OauthConsoleSecret       string = "skupper-console-certs"
+	ConsoleServerSecret      string = "skupper-console-certs"
 	OauthRouterConsoleSecret string = "skupper-router-console-certs"
 )
 
@@ -144,18 +146,22 @@ const (
 	TypeToken                   string = "connection-token"
 	TypeClaimRecord             string = "token-claim-record"
 	TypeClaimRequest            string = "token-claim"
+	TypeGatewayToken            string = "gateway-connection-token"
 	TypeTokenQualifier          string = BaseQualifier + "/type=connection-token"
 	TypeTokenRequestQualifier   string = BaseQualifier + "/type=connection-token-request"
 	TokenGeneratedBy            string = BaseQualifier + "/generated-by"
+	SiteVersion                 string = BaseQualifier + "/site-version"
 	TokenCost                   string = BaseQualifier + "/cost"
 	UpdatedAnnotation           string = InternalQualifier + "/updated"
 	AnnotationExcludes          string = BaseQualifier + "/exclude-annotations"
 	LabelExcludes               string = BaseQualifier + "/exclude-labels"
+	ServiceLabels               string = BaseQualifier + "/service-labels"
 	ComponentAnnotation         string = BaseQualifier + "/component"
 	SiteControllerIgnore        string = InternalQualifier + "/site-controller-ignore"
 	RouterComponent             string = "router"
 	ClaimExpiration             string = BaseQualifier + "/claim-expiration"
 	ClaimsRemaining             string = BaseQualifier + "/claims-remaining"
+	ClaimsMade                  string = BaseQualifier + "/claims-made"
 	ClaimUrlAnnotationKey       string = BaseQualifier + "/url"
 	ClaimPasswordDataKey        string = "password"
 	ClaimCaCertDataKey          string = "ca.crt"
@@ -165,7 +171,7 @@ const (
 	GatewayQualifier            string = InternalQualifier + "/gateway"
 )
 
-//standard labels
+// standard labels
 const (
 	AppLabel    string = "app.kubernetes.io/name"
 	PartOfLabel string = "app.kubernetes.io/part-of"
@@ -191,7 +197,6 @@ const (
 	ConsoleOpenShiftOauthServicePort       int32  = 443
 	ConsoleOpenShiftOauthServiceTargetPort int32  = 8443
 	ConsoleRouteName                       string = "skupper"
-	ConsoleIngressName                     string = "skupper-console"
 	RouterConsoleRouteName                 string = "skupper-router-console"
 	RouterConsoleServiceName               string = "skupper-router-console"
 )
@@ -271,6 +276,63 @@ type DeploymentSpec struct {
 	NodeSelector    map[string]string        `json:"nodeSelector,omitempty"`
 	CpuRequest      *resource.Quantity       `json:"cpuRequest,omitempty"`
 	MemoryRequest   *resource.Quantity       `json:"memoryRequest,omitempty"`
+	CpuLimit        *resource.Quantity       `json:"cpuLimit,omitempty"`
+	MemoryLimit     *resource.Quantity       `json:"memoryLimit,omitempty"`
+}
+
+func (s *DeploymentSpec) GetCpuRequest() resource.Quantity {
+	if s.CpuRequest == nil {
+		return resource.Quantity{}
+	}
+	return *s.CpuRequest
+}
+
+func (s *DeploymentSpec) GetMemoryRequest() resource.Quantity {
+	if s.MemoryRequest == nil {
+		return resource.Quantity{}
+	}
+	return *s.MemoryRequest
+}
+
+func (s *DeploymentSpec) GetCpuLimit() resource.Quantity {
+	if s.CpuLimit == nil {
+		return s.GetCpuRequest()
+	}
+	return *s.CpuLimit
+}
+
+func (s *DeploymentSpec) GetMemoryLimit() resource.Quantity {
+	if s.MemoryLimit == nil {
+		return s.GetMemoryRequest()
+	}
+	return *s.MemoryLimit
+}
+
+func (s *DeploymentSpec) HasCpuRequest() bool {
+	return s.CpuRequest != nil
+}
+
+func (s *DeploymentSpec) HasMemoryRequest() bool {
+	return s.MemoryRequest != nil
+}
+
+func (s *DeploymentSpec) HasCpuLimit() bool {
+	return s.CpuLimit != nil || s.HasCpuRequest()
+}
+
+func (s *DeploymentSpec) HasMemoryLimit() bool {
+	return s.MemoryLimit != nil || s.HasMemoryRequest()
+}
+
+type Resources interface {
+	GetCpuRequest() resource.Quantity
+	GetMemoryRequest() resource.Quantity
+	GetCpuLimit() resource.Quantity
+	GetMemoryLimit() resource.Quantity
+	HasCpuRequest() bool
+	HasMemoryRequest() bool
+	HasCpuLimit() bool
+	HasMemoryLimit() bool
 }
 
 // AssemblySpec for the links and connectors that form the VAN topology
@@ -321,6 +383,13 @@ const (
 	ConnectorRoleEdge                      = "edge"
 )
 
+const (
+	ConsoleIngressPrefix     = "skupper-console"
+	ClaimsIngressPrefix      = "skupper-claims"
+	InterRouterIngressPrefix = "skupper-inter-router"
+	EdgeIngressPrefix        = "skupper-edge"
+)
+
 type Connector struct {
 	Name           string `json:"name,omitempty"`
 	Role           string `json:"role,omitempty"`
@@ -360,24 +429,163 @@ type TransportConnectedSites struct {
 }
 
 type ServiceInterface struct {
-	Address      string                   `json:"address"`
-	Protocol     string                   `json:"protocol"`
-	Port         int                      `json:"port"`
-	EventChannel bool                     `json:"eventchannel,omitempty"`
-	Aggregate    string                   `json:"aggregate,omitempty"`
-	Headless     *Headless                `json:"headless,omitempty"`
-	Targets      []ServiceInterfaceTarget `json:"targets"`
-	Origin       string                   `json:"origin,omitempty"`
+	Address      string                   `json:"address" yaml:"address"`
+	Protocol     string                   `json:"protocol" yaml:"protocol"`
+	Ports        []int                    `json:"ports" yaml:"ports"`
+	EventChannel bool                     `json:"eventchannel,omitempty" yaml:"eventchannel,omitempty"`
+	Aggregate    string                   `json:"aggregate,omitempty" yaml:"aggregate,omitempty"`
+	Headless     *Headless                `json:"headless,omitempty" yaml:"headless,omitempty"`
+	Labels       map[string]string        `json:"labels,omitempty" yaml:"labels,omitempty"`
+	Targets      []ServiceInterfaceTarget `json:"targets" yaml:"targets,omitempty"`
+	Origin       string                   `json:"origin,omitempty" yaml:"origin,omitempty"`
+}
+
+type ServiceInterfaceList []ServiceInterface
+
+func (sl *ServiceInterfaceList) ConvertFrom(updates string) error {
+	err := jsonencoding.Unmarshal([]byte(updates), sl)
+	portsDefined := len(*sl) == 0 || len((*sl)[0].Ports) > 0
+	if err == nil && portsDefined {
+		return nil
+	}
+	// Try converting from V1 format
+	v1ServiceList := []ServiceInterfaceV1{}
+	err = jsonencoding.Unmarshal([]byte(updates), &v1ServiceList)
+	if err != nil {
+		return err
+	}
+	// Converting from V1
+	for i, v1Svc := range v1ServiceList {
+		svc := &(*sl)[i]
+		svc.Ports = []int{v1Svc.Port}
+		// Converting Headless
+		if v1Svc.Headless != nil {
+			v1hl := v1Svc.Headless
+			tPort := v1Svc.Port
+			if v1hl.TargetPort > 0 {
+				tPort = v1hl.TargetPort
+			}
+			svc.Headless.TargetPorts = map[int]int{
+				v1Svc.Port: tPort,
+			}
+		}
+		// Converting Targets
+		if len(v1Svc.Targets) > 0 {
+			for i, v1Target := range v1Svc.Targets {
+				tPort := v1Svc.Port
+				if v1Target.TargetPort > 0 {
+					tPort = v1Target.TargetPort
+				}
+				svc.Targets[i].TargetPorts = map[int]int{
+					v1Svc.Port: tPort,
+				}
+			}
+		}
+	}
+	return nil
 }
 
 type ServiceInterfaceTarget struct {
+	Name        string      `json:"name,omitempty"`
+	Selector    string      `json:"selector,omitempty"`
+	TargetPorts map[int]int `json:"targetPorts,omitempty"`
+	Service     string      `json:"service,omitempty"`
+}
+
+type ServiceInterfaceV1 struct {
+	Address      string                     `json:"address" yaml:"address"`
+	Protocol     string                     `json:"protocol" yaml:"protocol"`
+	Port         int                        `json:"port" yaml:"port"`
+	EventChannel bool                       `json:"eventchannel,omitempty" yaml:"eventchannel,omitempty"`
+	Aggregate    string                     `json:"aggregate,omitempty" yaml:"aggregate,omitempty"`
+	Headless     *HeadlessV1                `json:"headless,omitempty" yaml:"headless,omitempty"`
+	Labels       map[string]string          `json:"labels,omitempty" yaml:"labels,omitempty"`
+	Targets      []ServiceInterfaceTargetV1 `json:"targets" yaml:"targets,omitempty"`
+	Origin       string                     `json:"origin,omitempty" yaml:"origin,omitempty"`
+}
+
+type ServiceInterfaceTargetV1 struct {
 	Name       string `json:"name,omitempty"`
 	Selector   string `json:"selector,omitempty"`
 	TargetPort int    `json:"targetPort,omitempty"`
 	Service    string `json:"service,omitempty"`
 }
 
+func (service *ServiceInterface) AddTarget(target *ServiceInterfaceTarget) {
+	modified := false
+	targets := []ServiceInterfaceTarget{}
+	for _, t := range service.Targets {
+		if t.Name == target.Name {
+			modified = true
+			targets = append(targets, *target)
+		} else {
+			targets = append(targets, t)
+		}
+	}
+	if !modified {
+		targets = append(targets, *target)
+	}
+	service.Targets = targets
+}
+
 type Headless struct {
+	Name          string             `json:"name" yaml:"name"`
+	Size          int                `json:"size" yaml:"size"`
+	TargetPorts   map[int]int        `json:"targetPorts,omitempty" yaml:"targetPorts,omitempty"`
+	Affinity      map[string]string  `json:"affinity,omitempty" yaml:"affinity,omitempty"`
+	AntiAffinity  map[string]string  `json:"antiAffinity,omitempty" yaml:"antiAffinity,omitempty"`
+	NodeSelector  map[string]string  `json:"nodeSelector,omitempty" yaml:"nodeSelector,omitempty"`
+	CpuRequest    *resource.Quantity `json:"cpuRequest,omitempty" yaml:"cpuRequest,omitempty"`
+	MemoryRequest *resource.Quantity `json:"memoryRequest,omitempty" yaml:"memoryRequest,omitempty"`
+	CpuLimit      *resource.Quantity `json:"cpuLimit,omitempty" yaml:"cpuLimit,omitempty"`
+	MemoryLimit   *resource.Quantity `json:"memoryLimit,omitempty" yaml:"memoryLimit,omitempty"`
+}
+
+func (s *Headless) GetCpuRequest() resource.Quantity {
+	if s.CpuRequest == nil {
+		return resource.Quantity{}
+	}
+	return *s.CpuRequest
+}
+
+func (s *Headless) GetMemoryRequest() resource.Quantity {
+	if s.MemoryRequest == nil {
+		return resource.Quantity{}
+	}
+	return *s.MemoryRequest
+}
+
+func (s *Headless) GetCpuLimit() resource.Quantity {
+	if s.CpuLimit == nil {
+		return s.GetCpuRequest()
+	}
+	return *s.CpuLimit
+}
+
+func (s *Headless) GetMemoryLimit() resource.Quantity {
+	if s.MemoryLimit == nil {
+		return s.GetMemoryRequest()
+	}
+	return *s.MemoryLimit
+}
+
+func (s *Headless) HasCpuRequest() bool {
+	return s.CpuRequest != nil
+}
+
+func (s *Headless) HasMemoryRequest() bool {
+	return s.MemoryRequest != nil
+}
+
+func (s *Headless) HasCpuLimit() bool {
+	return s.CpuLimit != nil || s.HasCpuRequest()
+}
+
+func (s *Headless) HasMemoryLimit() bool {
+	return s.MemoryLimit != nil || s.HasMemoryRequest()
+}
+
+type HeadlessV1 struct {
 	Name          string             `json:"name"`
 	Size          int                `json:"size"`
 	TargetPort    int                `json:"targetPort,omitempty"`

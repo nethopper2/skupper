@@ -23,18 +23,18 @@ type serviceInterfaceUnbindCallArgs struct {
 }
 
 type serviceInterfaceBindCallArgs struct {
-	service    *types.ServiceInterface
-	targetType string
-	targetName string
-	protocol   string
-	targetPort int
+	service     *types.ServiceInterface
+	targetType  string
+	targetName  string
+	protocol    string
+	targetPorts map[int]int
 }
 
 type getHeadlessServiceConfigurationCallArgs struct {
 	targetName string
 	protocol   string
 	address    string
-	port       int
+	ports      []int
 }
 
 type siteConfigInspectCallArgs struct {
@@ -111,7 +111,7 @@ func (v *vanClientMock) RouterUpdateVersionInNamespace(ctx context.Context, hup 
 func (v *vanClientMock) ConnectorCreateFromFile(ctx context.Context, secretFile string, options types.ConnectorCreateOptions) (*corev1.Secret, error) {
 	return nil, nil
 }
-func (v *vanClientMock) ConnectorCreateSecretFromFile(ctx context.Context, secretFile string, options types.ConnectorCreateOptions) (*corev1.Secret, error) {
+func (v *vanClientMock) ConnectorCreateSecretFromData(ctx context.Context, secretData []byte, options types.ConnectorCreateOptions) (*corev1.Secret, error) {
 	return nil, nil
 }
 
@@ -134,7 +134,10 @@ func (v *vanClientMock) ConnectorTokenCreate(ctx context.Context, subject string
 func (v *vanClientMock) ConnectorTokenCreateFile(ctx context.Context, subject string, secretFile string) error {
 	return nil
 }
-func (v *vanClientMock) TokenClaimCreate(ctx context.Context, subject string, password []byte, expiry time.Duration, uses int, secretFile string) error {
+func (v *vanClientMock) TokenClaimCreate(ctx context.Context, name string, password []byte, expiry time.Duration, uses int) (*corev1.Secret, bool, error) {
+	return nil, true, nil
+}
+func (v *vanClientMock) TokenClaimCreateFile(ctx context.Context, subject string, password []byte, expiry time.Duration, uses int, secretFile string) error {
 	return nil
 }
 func (v *vanClientMock) ServiceInterfaceCreate(ctx context.Context, service *types.ServiceInterface) error {
@@ -153,39 +156,47 @@ func (v *vanClientMock) ServiceInterfaceUnbind(ctx context.Context, targetType s
 	return v.injectedReturns.serviceInterfaceUnbind
 }
 
-func (v *vanClientMock) GatewayBind(ctx context.Context, options types.GatewayBindOptions) error {
+func (v *vanClientMock) GatewayBind(ctx context.Context, gatewayName string, endpoint types.GatewayEndpoint) error {
 	return nil
 }
 
-func (v *vanClientMock) GatewayUnbind(ctx context.Context, options types.GatewayUnbindOptions) error {
+func (v *vanClientMock) GatewayUnbind(ctx context.Context, gatewayName string, endpoint types.GatewayEndpoint) error {
 	return nil
 }
 
-func (v *vanClientMock) GatewayExpose(ctx context.Context, options types.GatewayExposeOptions) (string, error) {
+func (v *vanClientMock) GatewayExpose(ctx context.Context, gatewayName string, gatewayType string, endpoint types.GatewayEndpoint) (string, error) {
 	return "", nil
 }
 
-func (v *vanClientMock) GatewayUnexpose(ctx context.Context, options types.GatewayUnexposeOptions) error {
+func (v *vanClientMock) GatewayUnexpose(ctx context.Context, gatewayName string, endpoint types.GatewayEndpoint, deleteLast bool) error {
 	return nil
 }
 
-func (v *vanClientMock) GatewayForward(ctx context.Context, options types.GatewayForwardOptions) error {
+func (v *vanClientMock) GatewayForward(ctx context.Context, gatewayName string, endpoint types.GatewayEndpoint, loopback bool) error {
 	return nil
 }
 
-func (v *vanClientMock) GatewayUnforward(ctx context.Context, proxyName string, address string) error {
+func (v *vanClientMock) GatewayUnforward(ctx context.Context, gatewayName string, endpoint types.GatewayEndpoint) error {
 	return nil
 }
 
-func (v *vanClientMock) GatewayInit(ctx context.Context, options types.GatewayInitOptions) (string, error) {
+func (v *vanClientMock) GatewayInit(ctx context.Context, gatewayName string, gatewayType string, configFile string) (string, error) {
 	return "", nil
 }
 
-func (v *vanClientMock) GatewayDownload(ctx context.Context, proxyName string, downloadPath string) (string, error) {
+func (v *vanClientMock) GatewayDownload(ctx context.Context, gatewayName string, downloadPath string) (string, error) {
 	return "", nil
 }
 
-func (v *vanClientMock) GatewayInspect(ctx context.Context, proxyName string) (*types.GatewayInspectResponse, error) {
+func (v *vanClientMock) GatewayExportConfig(ctx context.Context, targetGatewayName string, exportGatewayName string, exportPath string) (string, error) {
+	return "", nil
+}
+
+func (cli *vanClientMock) GatewayGenerateBundle(ctx context.Context, configFile string, bundlePath string) (string, error) {
+	return "", nil
+}
+
+func (v *vanClientMock) GatewayInspect(ctx context.Context, gatewayName string) (*types.GatewayInspectResponse, error) {
 	return &types.GatewayInspectResponse{}, nil
 }
 
@@ -193,7 +204,7 @@ func (v *vanClientMock) GatewayList(ctx context.Context) ([]*types.GatewayInspec
 	return nil, nil
 }
 
-func (v *vanClientMock) GatewayRemove(ctx context.Context, proxyName string) error {
+func (v *vanClientMock) GatewayRemove(ctx context.Context, gatewayName string) error {
 	return nil
 }
 
@@ -219,13 +230,13 @@ func (v *vanClientMock) SkupperDump(ctx context.Context, tarName string, version
 	return "", nil
 }
 
-func (v *vanClientMock) ServiceInterfaceBind(ctx context.Context, service *types.ServiceInterface, targetType string, targetName string, protocol string, targetPort int) error {
+func (v *vanClientMock) ServiceInterfaceBind(ctx context.Context, service *types.ServiceInterface, targetType string, targetName string, protocol string, targetPorts map[int]int) error {
 	var calledWith = serviceInterfaceBindCallArgs{
-		service:    service,
-		targetType: targetType,
-		targetName: targetName,
-		protocol:   protocol,
-		targetPort: targetPort,
+		service:     service,
+		targetType:  targetType,
+		targetName:  targetName,
+		protocol:    protocol,
+		targetPorts: targetPorts,
 	}
 	v.serviceInterfaceBindCalledWith = append(v.serviceInterfaceBindCalledWith, calledWith)
 
@@ -238,7 +249,7 @@ func (v *vanClientMock) ServiceInterfaceInspect(ctx context.Context, address str
 }
 
 func (v *vanClientMock) ServiceInterfaceList(ctx context.Context) ([]*types.ServiceInterface, error) {
-	//return []*ServiceInterface{}, nil
+	// return []*ServiceInterface{}, nil
 	return nil, nil
 }
 
@@ -251,12 +262,12 @@ func (v *vanClientMock) ServiceInterfaceUpdate(ctx context.Context, service *typ
 	return v.injectedReturns.serviceInterfaceUpdate
 }
 
-func (v *vanClientMock) GetHeadlessServiceConfiguration(targetName string, protocol string, address string, port int) (*types.ServiceInterface, error) {
+func (v *vanClientMock) GetHeadlessServiceConfiguration(targetName string, protocol string, address string, ports []int) (*types.ServiceInterface, error) {
 	var calledWith = getHeadlessServiceConfigurationCallArgs{
 		targetName: targetName,
 		protocol:   protocol,
 		address:    address,
-		port:       port,
+		ports:      ports,
 	}
 	v.getHeadlessServiceConfigurationCalledWith = append(v.getHeadlessServiceConfigurationCalledWith, calledWith)
 	return v.injectedReturns.getHeadlessServiceConfiguration.serviceInterface, v.injectedReturns.getHeadlessServiceConfiguration.err
@@ -284,7 +295,7 @@ func TestCmdUnexposeRun(t *testing.T) {
 
 		args := []string{targetType}
 
-		//supporting "targetType TargetName" and "targetType/targetName" notations
+		// supporting "targetType TargetName" and "targetType/targetName" notations
 		if targetName != "" {
 			args = append(args, targetName)
 		} else {
@@ -392,11 +403,11 @@ func TestExpose_NotBinding(t *testing.T) {
 	var err error
 	ctx := context.Background()
 	options := ExposeOptions{
-		Protocol:   "",
-		Address:    "",
-		Port:       0,
-		TargetPort: 0,
-		Headless:   false,
+		Protocol:    "",
+		Address:     "",
+		Ports:       []int{},
+		TargetPorts: []string{},
+		Headless:    false,
 	}
 
 	t.Run("ServiceInterfaceInspect returns error",
@@ -428,7 +439,7 @@ func TestExpose_NotBinding(t *testing.T) {
 			cli.injectedReturns.getHeadlessServiceConfiguration.serviceInterface = aService
 
 			options.Protocol = "theprotocol"
-			options.Port = 123
+			options.Ports = []int{123}
 
 			_, err = expose(cli, ctx, "statefulset", "name", options)
 			assert.Assert(t, err)
@@ -440,7 +451,7 @@ func TestExpose_NotBinding(t *testing.T) {
 				targetName: "name",
 				protocol:   options.Protocol,
 				address:    "ServiceName",
-				port:       options.Port,
+				ports:      options.Ports,
 			}
 
 			assert.Assert(t, cmp.Equal(cli.getHeadlessServiceConfigurationCalledWith[0], expectedGetHead, cmp.AllowUnexported(getHeadlessServiceConfigurationCallArgs{})))
@@ -484,10 +495,10 @@ func TestExpose_Binding(t *testing.T) {
 		assert.Assert(t, a.targetType == b.targetType)
 		assert.Assert(t, a.targetName == b.targetName)
 		assert.Assert(t, a.protocol == b.protocol)
-		assert.Assert(t, a.targetPort == b.targetPort)
+		assert.Assert(t, reflect.DeepEqual(a.targetPorts, b.targetPorts))
 		assert.Assert(t, a.service.Address == b.service.Address)
 		assert.Assert(t, a.service.Protocol == b.service.Protocol)
-		assert.Assert(t, a.service.Port == b.service.Port)
+		assert.Assert(t, reflect.DeepEqual(a.service.Ports, b.service.Ports))
 	}
 	options := ExposeOptions{}
 
@@ -495,25 +506,27 @@ func TestExpose_Binding(t *testing.T) {
 	options.Address = "TheService"
 	options.Headless = false
 	options.Protocol = test_protocol
-	options.Port = 123
-	options.TargetPort = 234
+	options.Ports = []int{123}
+	options.TargetPorts = []string{"123:234"}
 
 	expectedBindCall := serviceInterfaceBindCallArgs{
 		service: &types.ServiceInterface{
 			Address:  "TheService",
 			Protocol: test_protocol,
-			Port:     123,
+			Ports:    []int{123},
 		},
-		targetType: "any",
-		targetName: "name",
-		protocol:   test_protocol,
-		targetPort: 234,
+		targetType:  "any",
+		targetName:  "name",
+		protocol:    test_protocol,
+		targetPorts: map[int]int{123: 234},
 	}
 
 	t.Run("service not existent and options.expose.headless == false",
 		func(t *testing.T) {
 			cli := &vanClientMock{}
 
+			fmt.Println("TARGET PORTS =", targetPorts)
+			fmt.Println("OPTIONS =", options)
 			exposedAs, err := expose(cli, ctx, "any", "name", options)
 			assert.Assert(t, err)
 			assert.Equal(t, exposedAs, "TheService")
@@ -527,7 +540,7 @@ func TestExpose_Binding(t *testing.T) {
 			cli := &vanClientMock{}
 			aService := &types.ServiceInterface{
 				Address:  "TheOtherService",
-				Port:     options.Port,
+				Ports:    options.Ports,
 				Protocol: options.Protocol,
 			}
 			expectedBindCall := expectedBindCall
@@ -562,7 +575,7 @@ func TestExpose_Binding(t *testing.T) {
 
 func TestCmdExposeRun(t *testing.T) {
 	cmd := NewCmdExpose(nil)
-	cli = &vanClientMock{} //the global cli is used by the "RunE" func
+	cli = &vanClientMock{} // the global cli is used by the "RunE" func
 	cli := cli.(*vanClientMock)
 
 	args := []string{"service", "name"}
@@ -571,7 +584,7 @@ func TestCmdExposeRun(t *testing.T) {
 	err := cmd.RunE(&cobra.Command{}, args)
 	assert.Error(t, err, "--address option is required for target type 'service'")
 
-	//hack: forcing a expose function call error
+	// hack: forcing a expose function call error
 	args = []string{"pods", "name"}
 	cli.injectedReturns.serviceInterfaceInspect.err = fmt.Errorf("some error")
 	err = cmd.RunE(&cobra.Command{}, args)
@@ -617,6 +630,7 @@ func TestCmdBind(t *testing.T) {
 
 	injectedService := &types.ServiceInterface{
 		Protocol: "tcp",
+		Ports:    []int{567},
 		Headless: &types.Headless{
 			Name: "NotNil",
 		},
@@ -626,7 +640,8 @@ func TestCmdBind(t *testing.T) {
 		func(t *testing.T) {
 			resetCli()
 			protocol = "tcp"
-			targetPort = 567
+			targetPorts = []string{"567:567"}
+			expectedTargetPorts := map[int]int{567: 567}
 			args = []string{"TheService", "type", "name"}
 			lcli.injectedReturns.serviceInterfaceInspect.serviceInterface = injectedService
 			err := cmd.RunE(&cobra.Command{}, args)
@@ -636,7 +651,7 @@ func TestCmdBind(t *testing.T) {
 			assert.Assert(t, c.protocol == "tcp")
 			assert.Assert(t, c.targetType == "type")
 			assert.Assert(t, c.targetName == "name")
-			assert.Assert(t, c.targetPort == 567)
+			assert.Assert(t, reflect.DeepEqual(c.targetPorts, expectedTargetPorts))
 			assert.Assert(t, c.service == injectedService)
 
 		})
@@ -645,7 +660,7 @@ func TestCmdBind(t *testing.T) {
 		func(t *testing.T) {
 			resetCli()
 			protocol = "tcp"
-			targetPort = 567
+			targetPorts = []string{"567"}
 			args = []string{"TheService", "type", "name"}
 			lcli.injectedReturns.serviceInterfaceInspect.serviceInterface = injectedService
 			lcli.injectedReturns.serviceInterfaceBind = fmt.Errorf("some error")

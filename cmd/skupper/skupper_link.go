@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io/ioutil"
 	"os"
 	"time"
 
@@ -43,7 +44,11 @@ func NewCmdLinkCreate(newClient cobraFunc, flag string) *cobra.Command {
 				os.Exit(1)
 			}
 			connectorCreateOpts.SkupperNamespace = cli.GetNamespace()
-			secret, err := cli.ConnectorCreateSecretFromFile(context.Background(), args[0], connectorCreateOpts)
+			yaml, err := ioutil.ReadFile(args[0])
+			if err != nil {
+				return fmt.Errorf("Could not read connection token: %s", err.Error())
+			}
+			secret, err := cli.ConnectorCreateSecretFromData(context.Background(), yaml, connectorCreateOpts)
 			if err != nil {
 				return fmt.Errorf("Failed to create link: %w", err)
 			} else {
@@ -65,6 +70,7 @@ func NewCmdLinkCreate(newClient cobraFunc, flag string) *cobra.Command {
 						secret.ObjectMeta.Name)
 				}
 			}
+			fmt.Println("Check the status of the link using 'skupper link status'.")
 			return nil
 		},
 	}

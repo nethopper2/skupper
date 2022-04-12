@@ -13,7 +13,13 @@ import (
 )
 
 func (cli *VanClient) SiteConfigInspect(ctx context.Context, input *corev1.ConfigMap) (*types.SiteConfig, error) {
-	return cli.SiteConfigInspectInNamespace(ctx, input, cli.Namespace)
+	var namespace string
+	if input == nil {
+		namespace = cli.Namespace
+	} else {
+		namespace = input.ObjectMeta.Namespace
+	}
+	return cli.SiteConfigInspectInNamespace(ctx, input, namespace)
 }
 
 func (cli *VanClient) SiteConfigInspectInNamespace(ctx context.Context, input *corev1.ConfigMap, namespace string) (*types.SiteConfig, error) {
@@ -52,6 +58,9 @@ func (cli *VanClient) SiteConfigInspectInNamespace(ctx context.Context, input *c
 			result.Spec.RouterMode = string(types.TransportModeInterior)
 		}
 	}
+	if routers, ok := siteConfig.Data[SiteConfigRoutersKey]; ok {
+		result.Spec.Routers, _ = strconv.Atoi(routers)
+	}
 	if enableController, ok := siteConfig.Data[SiteConfigServiceControllerKey]; ok {
 		result.Spec.EnableController, _ = strconv.ParseBool(enableController)
 	} else {
@@ -71,6 +80,11 @@ func (cli *VanClient) SiteConfigInspectInNamespace(ctx context.Context, input *c
 		result.Spec.EnableRouterConsole, _ = strconv.ParseBool(enableRouterConsole)
 	} else {
 		result.Spec.EnableRouterConsole = false
+	}
+	if createNetworkPolicy, ok := siteConfig.Data[SiteConfigCreateNetworkPolicyKey]; ok {
+		result.Spec.CreateNetworkPolicy, _ = strconv.ParseBool(createNetworkPolicy)
+	} else {
+		result.Spec.CreateNetworkPolicy = false
 	}
 	if authMode, ok := siteConfig.Data[SiteConfigConsoleAuthenticationKey]; ok {
 		result.Spec.AuthMode = authMode
@@ -136,6 +150,12 @@ func (cli *VanClient) SiteConfigInspectInNamespace(ctx context.Context, input *c
 	if routerMemory, ok := siteConfig.Data[SiteConfigRouterMemoryKey]; ok && routerMemory != "" {
 		result.Spec.Router.Memory = routerMemory
 	}
+	if routerCpuLimit, ok := siteConfig.Data[SiteConfigRouterCpuLimitKey]; ok && routerCpuLimit != "" {
+		result.Spec.Router.CpuLimit = routerCpuLimit
+	}
+	if routerMemoryLimit, ok := siteConfig.Data[SiteConfigRouterMemoryLimitKey]; ok && routerMemoryLimit != "" {
+		result.Spec.Router.MemoryLimit = routerMemoryLimit
+	}
 	if routerNodeSelector, ok := siteConfig.Data[SiteConfigRouterNodeSelectorKey]; ok && routerNodeSelector != "" {
 		result.Spec.Router.NodeSelector = routerNodeSelector
 	}
@@ -173,6 +193,12 @@ func (cli *VanClient) SiteConfigInspectInNamespace(ctx context.Context, input *c
 	}
 	if controllerMemory, ok := siteConfig.Data[SiteConfigControllerMemoryKey]; ok && controllerMemory != "" {
 		result.Spec.Controller.Memory = controllerMemory
+	}
+	if controllerCpuLimit, ok := siteConfig.Data[SiteConfigControllerCpuLimitKey]; ok && controllerCpuLimit != "" {
+		result.Spec.Controller.CpuLimit = controllerCpuLimit
+	}
+	if controllerMemoryLimit, ok := siteConfig.Data[SiteConfigControllerMemoryLimitKey]; ok && controllerMemoryLimit != "" {
+		result.Spec.Controller.MemoryLimit = controllerMemoryLimit
 	}
 	if controllerNodeSelector, ok := siteConfig.Data[SiteConfigControllerNodeSelectorKey]; ok && controllerNodeSelector != "" {
 		result.Spec.Controller.NodeSelector = controllerNodeSelector
