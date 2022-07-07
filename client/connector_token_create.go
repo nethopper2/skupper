@@ -129,13 +129,14 @@ func configureHostPorts(result *RouterHostPorts, cli *VanClient, namespace strin
 			return false
 		} else {
 			if service.Spec.Type == corev1.ServiceTypeLoadBalancer {
+				fmt.Printf("Nethopper,skupper-router service is loadbalancer: %s", err)
 				host := kube.GetLoadBalancerHostOrIp(service)
 				if host != "" {
 					result.Hosts = host
 					result.InterRouter.Host = host
-					result.InterRouter.Port = "32671"
+					result.InterRouter.Port = "8080"
 					result.Edge.Host = host
-					result.Edge.Port = "31671"
+					result.Edge.Port = "443"
 					return true
 				} else {
 					fmt.Printf("LoadBalancer Host/IP not yet allocated for service %s, ", service.ObjectMeta.Name)
@@ -175,9 +176,9 @@ func configureHostPorts(result *RouterHostPorts, cli *VanClient, namespace strin
 			host := fmt.Sprintf("%s.%s", types.TransportServiceName, namespace)
 			result.Hosts = host
 			result.InterRouter.Host = host
-			result.InterRouter.Port = "32671"
+			result.InterRouter.Port = "8080"
 			result.Edge.Host = host
-			result.Edge.Port = "31671"
+			result.Edge.Port = "443"
 			return true
 		}
 	}
