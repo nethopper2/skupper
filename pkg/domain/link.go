@@ -94,7 +94,7 @@ func (c *ClaimRedeemer) RedeemClaim(claim *corev1.Secret) error {
 	}
 
 	ca, ok := claim.Data[types.ClaimCaCertDataKey]
-	transport := &http.Transport{}
+	transport := &http.Transport{Proxy: http.ProxyFromEnvironment}
 	if ok {
 		caPool := x509.NewCertPool()
 		caPool.AppendCertsFromPEM(ca)
